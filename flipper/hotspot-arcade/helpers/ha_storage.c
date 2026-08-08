@@ -36,6 +36,8 @@ void ha_storage_load_config(HotspotArcadeApp* app) {
                 furi_string_set(app->ssid, tmp);
                 have_ssid = true;
             }
+            flipper_format_rewind(ff);
+            if(flipper_format_read_string(ff, "Pass", tmp)) furi_string_set(app->pass, tmp);
             uint32_t v = 0;
             flipper_format_rewind(ff);
             if(flipper_format_read_uint32(ff, "Sound", &v, 1)) app->sound_on = (v != 0);
@@ -50,6 +52,9 @@ void ha_storage_load_config(HotspotArcadeApp* app) {
     flipper_format_free(ff);
     furi_string_free(tmp);
     furi_record_close(RECORD_STORAGE);
+    // No explicit "have_pass" flag needed: an absent key leaves app->pass at
+    // whatever furi_string_alloc() gave it, i.e. "" (open), which is the correct
+    // default for a config file that predates this field.
     if(!have_ssid) furi_string_set(app->ssid, "Hotspot Arcade");
 }
 
@@ -59,6 +64,7 @@ void ha_storage_save_config(HotspotArcadeApp* app) {
     if(flipper_format_file_open_always(ff, HA_CONFIG_PATH)) {
         flipper_format_write_header_cstr(ff, "Hotspot Arcade Config", 1);
         flipper_format_write_string_cstr(ff, "SSID", furi_string_get_cstr(app->ssid));
+        flipper_format_write_string_cstr(ff, "Pass", furi_string_get_cstr(app->pass));
         uint32_t sound = app->sound_on ? 1 : 0;
         uint32_t vibro = app->vibro_on ? 1 : 0;
         flipper_format_write_uint32(ff, "Sound", &sound, 1);

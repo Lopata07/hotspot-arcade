@@ -21,6 +21,7 @@
 #include "scenes/ha_scene.h"
 
 #define HA_SSID_MAX             (33) // 32 + NUL
+#define HA_PASS_MAX             (64) // 63 + NUL, WPA2-PSK's upper bound
 #define HA_MAX_PLAYERS          (12)
 #define HA_NICK_LEN             (20)
 #define HA_MAX_ASSETS           (8)
@@ -111,6 +112,8 @@ typedef struct HotspotArcadeApp {
     // Config (persisted)
     FuriString* ssid;
     char ssid_buf[HA_SSID_MAX];
+    FuriString* pass; // "" = open network
+    char pass_buf[HA_PASS_MAX];
     bool sound_on;
     bool vibro_on;
     char lang[8]; // content language code, "" = English (streams packs/<game>/<lang>/)

@@ -105,6 +105,7 @@ static HotspotArcadeApp* ha_app_alloc(void) {
         app->view_dispatcher, HaViewVarItemList, variable_item_list_get_view(app->var_item_list));
 
     app->ssid = furi_string_alloc();
+    app->pass = furi_string_alloc();
     app->status = furi_string_alloc_set_str("idle");
     app->console = furi_string_alloc();
     app->last_event = furi_string_alloc();
@@ -146,6 +147,7 @@ static void ha_app_free(HotspotArcadeApp* app) {
     ha_uart_deinit(app->uart);
 
     furi_string_free(app->ssid);
+    furi_string_free(app->pass);
     furi_string_free(app->status);
     furi_string_free(app->console);
     furi_string_free(app->last_event);
