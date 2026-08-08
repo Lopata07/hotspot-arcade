@@ -357,7 +357,22 @@ static void send_next_file(HotspotArcadeApp* app) {
         // All files streamed: stream the content packs (as votable topics), then
         // name the AP and start.
         ha_content_stream_packs(app);
-        ha_proto_send_str(app->uart, HA_MSG_SET_AP, furi_string_get_cstr(app->ssid));
+        // Payload: SSID, NUL, PASSWORD (no trailing NUL — the ESP takes the rest of
+        // the frame as-is). No embedded NUL after PASSWORD means an old ESP build
+        // (which just memcpy's the whole payload as the SSID) still gets a usable,
+        // if wrong-looking, name; this build's ESP looks for the separator instead.
+        FuriString* payload = furi_string_alloc();
+        furi_string_cat(payload, app->ssid);
+        furi_string_push_back(payload, '\0');
+        furi_string_cat(payload, app->pass);
+        ha_proto_send(
+            app->uart,
+            HA_MSG_SET_AP,
+            (const uint8_t*)furi_string_get_cstr(payload),
+            furi_string_size(payload)); // size already includes the pushed separator NUL —
+                                         // furi_string_push_back() counts every byte it
+                                         // pushes, NUL included, so no +1 is needed here.
+        furi_string_free(payload);
         app->hs = HaHsSetAp;
         return;
     }

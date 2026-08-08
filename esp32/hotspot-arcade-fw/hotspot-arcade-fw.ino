@@ -26,6 +26,7 @@ static AsyncWebServer server(80);
 static AsyncWebSocket ws("/ws");
 static IPAddress apIP(192, 168, 4, 1);
 static char apName[33] = "Hotspot Arcade";
+static char apPass[64] = ""; // "" = open network
 static bool portalRunning = false;
 static uint8_t apMaxConn = AP_MAX_CONN;
 
@@ -159,7 +160,11 @@ static void onWsEvent(
 static void startPortal() {
     WiFi.mode(WIFI_AP);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-    WiFi.softAP(apName, nullptr, 1, 0, apMaxConn); // open AP, up to apMaxConn stations
+    // A non-empty password switches the driver to WPA2-PSK; empty keeps the
+    // network open. apPass is validated Flipper-side (0 or 8-63 chars) before it's
+    // ever sent, but WiFi.softAP() itself would just silently misbehave on 1-7
+    // chars, so that floor lives entirely in the UI (Task 4), not here.
+    WiFi.softAP(apName, apPass[0] ? apPass : nullptr, 1, 0, apMaxConn);
     delay(100);
     uartStatus("ap_ok");
 
@@ -238,9 +243,24 @@ static void dispatchFrame() {
         break;
     case HA_MSG_SET_AP:
         if(rxLen > 0) {
-            size_t n = rxLen < sizeof(apName) - 1 ? rxLen : sizeof(apName) - 1;
+            // Payload is "SSID\0PASSWORD". A NUL inside rxLen means the sending
+            // Flipper knows about the password field; without one (older Flipper
+            // build) the whole payload is just the SSID, same as before this change.
+            size_t ssidLen = 0;
+            while(ssidLen < rxLen && rxBuf[ssidLen] != '\0') ssidLen++;
+            size_t n = ssidLen < sizeof(apName) - 1 ? ssidLen : sizeof(apName) - 1;
             memcpy(apName, rxBuf, n);
             apName[n] = '\0';
+
+            if(ssidLen < rxLen) {
+                size_t passStart = ssidLen + 1;
+                size_t passLen = rxLen - passStart;
+                size_t pn = passLen < sizeof(apPass) - 1 ? passLen : sizeof(apPass) - 1;
+                memcpy(apPass, rxBuf + passStart, pn);
+                apPass[pn] = '\0';
+            } else {
+                apPass[0] = '\0';
+            }
         }
         uartStatus("ap_set");
         break;
