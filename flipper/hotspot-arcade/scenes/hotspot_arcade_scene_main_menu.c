@@ -9,6 +9,7 @@ typedef enum {
     MenuConsole,
     MenuStop,
     MenuSsid,
+    MenuPassword,
     MenuFlashFirmware,
     MenuSettings,
     MenuAbout,
@@ -46,6 +47,12 @@ static void ha_menu_build(HotspotArcadeApp* app) {
     furi_string_printf(label, "SSID: %s", furi_string_get_cstr(app->ssid));
     submenu_add_item(app->submenu, furi_string_get_cstr(label), MenuSsid, ha_menu_cb, app);
     furi_string_free(label);
+
+    FuriString* pass_label = furi_string_alloc();
+    furi_string_printf(
+        pass_label, "Password: %s", furi_string_size(app->pass) ? "set" : "open");
+    submenu_add_item(app->submenu, furi_string_get_cstr(pass_label), MenuPassword, ha_menu_cb, app);
+    furi_string_free(pass_label);
 
     if(!app->session_active)
         submenu_add_item(app->submenu, "Install Firmware", MenuFlashFirmware, ha_menu_cb, app);
@@ -102,6 +109,9 @@ bool hotspot_arcade_scene_main_menu_on_event(void* context, SceneManagerEvent ev
         return true;
     case MenuSsid:
         scene_manager_next_scene(app->scene_manager, HaSceneSsidInput);
+        return true;
+    case MenuPassword:
+        scene_manager_next_scene(app->scene_manager, HaScenePassInput);
         return true;
     case MenuFlashFirmware:
         // Pick which board to flash; the picker sets the manifest and pushes the
