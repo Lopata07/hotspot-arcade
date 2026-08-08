@@ -209,18 +209,31 @@ void punchBuildPairs(uint32_t now) {
 // prompt where pid is author B of the previous pair. Scanning all pairs for a
 // match is O(pairCount) (<= 12) and correct by construction: each pid appears as
 // .a in exactly one pair and as .b in exactly one (different) pair.
+//
+// Truncate the SOURCE first, then copy into the pair -- copying into pr.textA/
+// textB at their own size and truncating afterward is a no-op forever: strlcpy's
+// own byte-blind clip already bounds the result to sizeof(pr.textA)-1 (== 160),
+// which is always < the 161 punchUtf8Truncate is told to check against, so its
+// "was this too long" guard (`len < maxBytes`) can never fire. text/tmp are
+// deliberately wider than PUNCH_ANSWER_BYTES (onInput()'s "quip" scratch buffer
+// is char[300]) so the full, un-clipped input is what punchUtf8Truncate actually
+// inspects and cuts, before the final bounded copy into the pair's own buffer.
 void punchAnswer(uint8_t pid, int slot, const char* text) {
     if(_active != HA_GAME_PUNCHLINE || _punch.pt.phase != 2 || _punch.stage != 0) return;
     if(_punch.pt.round >= PUNCH_ROUNDS) return; // round 3 uses punchLashAnswer (Task 9)
     for(uint8_t i = 0; i < _punch.pairCount; i++) {
         PunchPair& pr = _punch.pairs[i];
         if(slot == 0 && pr.a == pid && !pr.inA) {
-            strlcpy(pr.textA, text, sizeof(pr.textA));
-            punchUtf8Truncate(pr.textA, sizeof(pr.textA));
+            char tmp[300];
+            strlcpy(tmp, text, sizeof(tmp));
+            punchUtf8Truncate(tmp, PUNCH_ANSWER_BYTES);
+            strlcpy(pr.textA, tmp, sizeof(pr.textA));
             pr.inA = true;
         } else if(slot == 1 && pr.b == pid && !pr.inB) {
-            strlcpy(pr.textB, text, sizeof(pr.textB));
-            punchUtf8Truncate(pr.textB, sizeof(pr.textB));
+            char tmp[300];
+            strlcpy(tmp, text, sizeof(tmp));
+            punchUtf8Truncate(tmp, PUNCH_ANSWER_BYTES);
+            strlcpy(pr.textB, tmp, sizeof(pr.textB));
             pr.inB = true;
         }
     }
