@@ -73,3 +73,24 @@ for (const n of [3, 12]) {
   }
   console.log("punchline: N=" + n + " pairing checks passed");
 }
+
+// Every player writes both of their answers. A truncation probe: 60 Cyrillic
+// chars (2 bytes each = 120 bytes, over the 40-char/PUNCH_ANSWER_BYTES limit)
+// must come back cut at a whole character, never a mangled trailing byte.
+const long60 = "б".repeat(60);
+for (const pid of [1, 2, 3, 4]) {
+  out = e.input(pid, { t: "quip", n: seen[pid][0].n, text: long60 });
+}
+for (const pid of [1, 2, 3]) {
+  out = e.input(pid, { t: "quip", n: seen[pid][1].n, text: "short answer " + pid });
+}
+// Player 4's second answer is deliberately left unsent -- timeout should still
+// move the game on with it empty, not stall forever.
+for (let ms = 5000; ms <= 65000; ms += 1000) out = out.concat(e.tick(ms));
+
+for (const pid of [1, 2, 3, 4]) {
+  const m = lastToWs(out, pid, "punch");
+  assert.equal(m.msg.stage, "vote", "moved to voting after the write deadline");
+}
+
+console.log("punchline: write stage + truncation + timeout checks passed");

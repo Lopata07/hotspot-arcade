@@ -131,6 +131,23 @@ static inline int haUtf8Len(const char* s) {
 #define GC_REVEAL_MS 6000
 #define GC_SPEED_MS 12000 // speed bonus decays to 0 over this window
 
+// Punchline (Quiplash-style write-then-vote); full game logic lives in
+// ha_game_punchline.h, included further down, but these sizes are needed here
+// too (onInput()'s "quip" branch sizes its text buffer from PUNCH_ANSWER_BYTES),
+// so -- like every other game's constants above -- they're defined at the top
+// of this file rather than in the per-game header.
+#define PUNCH_ANSWER_CHARS 40 // limit shown to the player (counter, maxlength)
+#define PUNCH_ANSWER_BYTES 161 // 40 * 4 (worst-case UTF-8) + NUL
+#define PUNCH_PROMPT_BYTES 128 // matches the {"prompt":...} pack item budget
+#define PUNCH_ROUNDS 3
+#define PUNCH_WRITE_SECS 60
+#define PUNCH_VOTE_SECS 20
+#define PUNCH_LASH_VOTE_SECS 30
+#define PUNCH_REVEAL_MS 5000
+#define PUNCH_LASH_REVEAL_MS 8000
+#define PUNCH_LASH_VOTES 3 // votes each player casts in round 3
+#define PUNCH_UNANIMOUS_BONUS 250
+
 // ---- sinks implemented in the .ino ----
 void haWsSendWs(uint32_t wsId, const String& msg); // to one socket (0 = no-op)
 void haWsBroadcast(const String& msg); // to all connected sockets
@@ -853,6 +870,11 @@ public:
             if(ha_json_int(json, "kiss", &k) && ha_json_int(json, "marry", &m) &&
                ha_json_int(json, "kill", &x))
                 kmkAssign(pid, k, m, x);
+        } else if(strcmp(type, "quip") == 0) {
+            int n;
+            char txt[PUNCH_ANSWER_BYTES];
+            if(ha_json_int(json, "n", &n) && ha_json_str(json, "text", txt, sizeof(txt)))
+                punchAnswer(pid, n, txt);
         } else if(strcmp(type, "again") == 0) {
             triviaAgain(pid);
             drawAgain(pid);
