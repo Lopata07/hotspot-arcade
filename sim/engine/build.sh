@@ -27,7 +27,7 @@ if [ "${1:-}" = "--asan" ]; then
     echo "==> building with ASan/UBSan"
 fi
 
-emcc "$REPO/sim/engine/ha_sim.cpp" \
+em++ "$REPO/sim/engine/ha_sim.cpp" \
     -I "$REPO/sim/engine" \
     "${FLAGS[@]}" \
     -sMODULARIZE=1 \
