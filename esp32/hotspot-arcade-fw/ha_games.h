@@ -762,6 +762,8 @@ public:
             spectrumClear();
         else if(_active == HA_GAME_KMK)
             kmkClear();
+        else if(_active == HA_GAME_PUNCHLINE)
+            punchClear();
         else if(_active == HA_GAME_CHESS)
             chessClear();
         pushAll();

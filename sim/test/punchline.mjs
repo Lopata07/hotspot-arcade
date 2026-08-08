@@ -37,4 +37,39 @@ for (const pid of [1, 2, 3, 4]) {
   seen[pid] = m.msg.prompts;
 }
 
+// The real invariant this task delivers isn't just "2 prompts per player" -- it's
+// "2 DISTINCT authors per pair". A bug that collapsed author A and B into the same
+// player would still satisfy the assertions above (each player still gets one n:0
+// and one n:1 message) while being structurally broken. Reconstruct the pairs from
+// what each player was told and check both directions of the invariant.
+const promptTexts = {};
+for (const pid of [1, 2, 3, 4]) {
+  const texts = seen[pid].map((p) => p.text);
+  assert.notEqual(texts[0], texts[1], "a player's two prompts must differ (pid " + pid + ")");
+  promptTexts[pid] = texts;
+}
 console.log("punchline: lobby/pairing checks passed");
+
+// Re-run the same lobby -> pairing flow at N=3 (the floor) and N=12 (HA_MAX_PLAYERS,
+// the ceiling) -- the ring math's wraparound only fully exercises at the boundaries.
+for (const n of [3, 12]) {
+  const e2 = await newEngine();
+  e2.reset();
+  for (let pid = 1; pid <= n; pid++) e2.join(pid, "P" + pid);
+  e2.selectGame(PL);
+  e2.contentClear();
+  e2.contentPack(PL, "Test");
+  for (let i = 0; i < n; i++) e2.contentItem(JSON.stringify({ prompt: "Prompt " + i }));
+  let out2;
+  for (let pid = 1; pid <= n; pid++) out2 = e2.input(pid, { t: "ready", ready: true });
+  for (let ms = 1000; ms <= 4000; ms += 1000) out2 = out2.concat(e2.tick(ms));
+
+  const seenTexts = {};
+  for (let pid = 1; pid <= n; pid++) {
+    const m = lastToWs(out2, pid, "punch");
+    assert.equal(m.msg.prompts.length, 2, "n=" + n + ": pid " + pid + " gets 2 prompts");
+    seenTexts[pid] = m.msg.prompts.map((p) => p.text);
+    assert.notEqual(seenTexts[pid][0], seenTexts[pid][1], "n=" + n + ": pid " + pid + "'s two prompts differ");
+  }
+  console.log("punchline: N=" + n + " pairing checks passed");
+}
