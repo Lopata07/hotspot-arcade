@@ -74,12 +74,19 @@ for (const n of [3, 12]) {
   console.log("punchline: N=" + n + " pairing checks passed");
 }
 
-// Every player writes both of their answers. A truncation probe: 60 Cyrillic
-// chars (2 bytes each = 120 bytes, over the 40-char/PUNCH_ANSWER_BYTES limit)
-// must come back cut at a whole character, never a mangled trailing byte.
-const long60 = "б".repeat(60);
+// Every player writes both of their answers. A truncation probe: 45 Cyrillic
+// chars = 90 bytes -- still not enough. Need > PUNCH_ANSWER_BYTES (161) worth of
+// bytes to actually exercise punchUtf8Truncate()'s cut path (its early-return at
+// `len < maxBytes` means anything under 161 bytes round-trips untouched and proves
+// nothing about the truncation logic itself). 90 Cyrillic chars = 180 bytes clears
+// it with margin. This can't yet assert on the *truncated result* -- punchJson()'s
+// vote-stage shape doesn't expose textA/textB content until Task 8's reveal JSON
+// does -- but it does prove punchUtf8Truncate() runs on oversized input without
+// corrupting engine state or crashing, which is the adversarial-input backstop
+// this buffer exists for.
+const oversized90 = "б".repeat(90);
 for (const pid of [1, 2, 3, 4]) {
-  out = e.input(pid, { t: "quip", n: seen[pid][0].n, text: long60 });
+  out = e.input(pid, { t: "quip", n: seen[pid][0].n, text: oversized90 });
 }
 for (const pid of [1, 2, 3]) {
   out = e.input(pid, { t: "quip", n: seen[pid][1].n, text: "short answer " + pid });
