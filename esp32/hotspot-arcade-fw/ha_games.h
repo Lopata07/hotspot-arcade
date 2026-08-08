@@ -458,6 +458,7 @@ public:
         battleClear();
         spectrumClear();
         kmkClear();
+        punchClear();
         chessClear();
     }
 
@@ -525,6 +526,7 @@ public:
         battleClear();
         spectrumClear();
         kmkClear();
+        punchClear();
         chessClear();
         pushAll();
     }
@@ -580,6 +582,8 @@ public:
         _spec.packCount = 0;
         for(int i = 0; i < TRIVIA_MAX_TOPICS; i++) _kmk.packs[i] = WordPack{};
         _kmk.packCount = 0;
+        for(int i = 0; i < TRIVIA_MAX_TOPICS; i++) _punch.packs[i] = WordPack{};
+        _punch.packCount = 0;
         _packGame = 0;
     }
 
@@ -617,6 +621,12 @@ public:
                 _kmk.packs[_kmk.packCount].name = name;
                 _kmk.packCount++;
             }
+        } else if(game == HA_GAME_PUNCHLINE) {
+            if(_punch.packCount < TRIVIA_MAX_TOPICS) {
+                _punch.packs[_punch.packCount] = WordPack{};
+                _punch.packs[_punch.packCount].name = name;
+                _punch.packCount++;
+            }
         }
     }
 
@@ -628,6 +638,7 @@ public:
         else if(_packGame == HA_GAME_DRAW) drawLoadItem(json);
         else if(_packGame == HA_GAME_SPECTRUM) spectrumLoadItem(json);
         else if(_packGame == HA_GAME_KMK) kmkLoadItem(json);
+        else if(_packGame == HA_GAME_PUNCHLINE) punchLoadItem(json);
         // Unknown game ids are dropped on purpose: a newer Flipper must not be able
         // to corrupt an older board's state.
     }
@@ -777,6 +788,8 @@ public:
             spectrumTick(now);
         else if(_active == HA_GAME_KMK)
             kmkTick(now);
+        else if(_active == HA_GAME_PUNCHLINE)
+            punchTick(now);
         else if(_active == HA_GAME_CHESS)
             chessTick(now);
     }
@@ -817,6 +830,7 @@ public:
             gcReady(pid, r);
             spectrumReady(pid, r);
             kmkReady(pid, r);
+            punchReady(pid, r);
         } else if(strcmp(type, "vote") == 0 && ha_json_int(json, "topic", &v)) {
             triviaVote(pid, v);
         } else if(strcmp(type, "vote") == 0 && ha_json_int(json, "pack", &v)) {
@@ -824,6 +838,7 @@ public:
             scrambleVote(pid, v);
             spectrumVote(pid, v);
             kmkVote(pid, v);
+            punchVote(pid, v);
         } else if(strcmp(type, "tap") == 0) {
             reactTap(pid);
         } else if(strcmp(type, "clue") == 0) {
@@ -922,6 +937,15 @@ private:
     BattleMatch _bm[BATTLE_MAX] = {};
     SpectrumState _spec = {};
     KmkState _kmk = {};
+    // ha_game_punchline.h is included here (rather than at the very end of the
+    // class, as with other games' method bodies) because it defines `struct
+    // PunchState`, and a non-static data member needs a *complete* type at its
+    // declaration point -- unlike member function bodies (which get deferred,
+    // "complete-class context" parsing and can freely call methods declared
+    // later in the class, e.g. selectGame() above already calls pushAll()
+    // before pushAll() is textually defined).
+#include "ha_game_punchline.h"
+    PunchState _punch = {};
     ChessMatch _cm[CHESS_MAX] = {};
 
     uint8_t freePid() {
@@ -964,6 +988,8 @@ private:
                 haWsSendWs(_p[pid].wsId, spectrumJson(pid));
             else if(_active == HA_GAME_KMK)
                 haWsSendWs(_p[pid].wsId, kmkJson(pid));
+            else if(_active == HA_GAME_PUNCHLINE)
+                haWsSendWs(_p[pid].wsId, punchJson(pid));
             else if(_active == HA_GAME_CHESS)
                 haWsSendWs(_p[pid].wsId, chessJson(pid));
         }
@@ -1026,6 +1052,8 @@ private:
             return "kmk";
         case HA_GAME_CHESS:
             return "chess";
+        case HA_GAME_PUNCHLINE:
+            return "punchline";
         default:
             return "none";
         }
@@ -2350,6 +2378,8 @@ private:
             spectrumCheckStart();
         else if(_active == HA_GAME_KMK)
             kmkCheckStart();
+        else if(_active == HA_GAME_PUNCHLINE)
+            punchCheckStart();
     }
 
     // ---------- would you rather (live A/B poll) ----------

@@ -61,6 +61,8 @@
 #define HA_GAME_SPECTRUM 13 // wavelength-style spectrum guessing (party)
 #define HA_GAME_KMK      14 // kiss marry kill (party)
 #define HA_GAME_CHESS    15 // chess (1v1, full FIDE rules)
+#define HA_GAME_PUNCHLINE 200 // punchline (write-then-vote), kept far outside the
+    // vanilla range so a future upstream game id never collides on rebase
 
 static inline uint8_t ha_crc8_upd(uint8_t crc, uint8_t b) {
     crc ^= b;
