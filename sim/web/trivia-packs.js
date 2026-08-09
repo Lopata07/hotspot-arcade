@@ -132,6 +132,7 @@ export const PACK_DIRS = [
   { game: 5, dir: "draw", names: ["classic", "movies", "food", "nature", "animals", "fantasy"] },
   { game: 13, dir: "spectrum", names: ["everyday", "extremes", "opinions", "tastes"] },
   { game: 14, dir: "kmk", names: ["famous", "fiction", "historical", "mix"] },
+  { game: 200, dir: "punchline", names: ["absurd"] },
 ];
 
 export const LANGS = {

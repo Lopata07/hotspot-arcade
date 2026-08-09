@@ -402,7 +402,7 @@ void punchLashVote(uint8_t pid, uint8_t target, bool on) {
     if(_punch.pt.round < PUNCH_ROUNDS) return;
     if(_punch.pairRevealing) return; // reveal already fired -- a late/replayed vote must not
                                       // be able to reopen scoring and pay the pool out again
-    if(target < 1 || target > HA_MAX_PLAYERS || !_p[target].used || target == pid) return;
+    if(target < 1 || target > HA_MAX_PLAYERS || !_p[target].used || !_punch.lashIn[target] || target == pid) return;
     bool have = _punch.lashVotedFor[pid][target];
     if(on == have) return;
     if(on) {

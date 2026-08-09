@@ -340,3 +340,131 @@ const lob = lastToWs(out, 1, "punch");
 assert.equal(lob.msg.phase, "lobby", "again resets to the lobby");
 
 console.log("punchline: Last Lash, podium, and replay checks passed");
+
+// Fix-3 regression: punchLashVote() must reject a vote for a target who is
+// connected (_p[target].used) but never actually submitted a Last Lash answer
+// (!_punch.lashIn[target]). The real phone UI can't produce this -- it only ever
+// renders cards from m.answers, which is already filtered by lashIn -- but a
+// hand-crafted WS frame could vote for such a target anyway before this fix,
+// minting pool share for a player with no answer at all and breaking the pool's
+// sum-to-3000 conservation invariant. This also exercises the disconnect-
+// denominator angle from Task 9: a used-but-non-contributing player must not
+// silently receive pool share either.
+{
+  const n = 5;
+  const eg = await newEngine();
+  eg.reset();
+  for (let pid = 1; pid <= n; pid++) eg.join(pid, "G" + pid);
+  eg.selectGame(PL);
+  eg.contentClear();
+  eg.contentPack(PL, "Test");
+  for (let i = 0; i < n; i++) eg.contentItem(JSON.stringify({ prompt: "Gap prompt " + i }));
+  for (let pid = 1; pid < n; pid++) eg.input(pid, { t: "ready", ready: true });
+  let outG = eg.input(n, { t: "ready", ready: true });
+  for (let ms = 1000; ms <= 4000; ms += 1000) outG = outG.concat(eg.tick(ms));
+
+  // Play both paired rounds to completion (everyone writes both prompts, every
+  // match is voted unanimously for side A) purely to reach round 3, the Last
+  // Lash -- the payouts here don't matter, only getting there does.
+  const ids = Array.from({ length: n }, (_, i) => i + 1);
+  for (let round = 1; round <= 2; round++) {
+    for (const pid of ids) {
+      const m = lastToWs(outG, pid, "punch");
+      for (const p of m.msg.prompts) {
+        outG = eg.input(pid, { t: "quip", n: p.n, text: "r" + round + " ans " + pid + "-" + p.n });
+      }
+    }
+    for (let match = 0; match < n; match++) {
+      const voters = ids.filter((pid) => {
+        const m = lastToWs(outG, pid, "punch");
+        return m.msg.stage === "vote" && m.msg.match === match && !m.msg.iam;
+      });
+      for (const voter of voters) outG = eg.input(voter, { t: "pick", n: 0 });
+      const rev = lastToWs(outG, voters[0], "punch");
+      for (let ms = 0; ms < 5500; ms += 500) outG = outG.concat(eg.tick(rev.msg.deadline - 5000 + ms));
+    }
+  }
+
+  const mLash = lastToWs(outG, 1, "punch");
+  assert.equal(mLash.msg.round, 3, "gap test: reached round 3 (Last Lash)");
+  assert.equal(mLash.msg.lash, true, "gap test: round 3 is the Last Lash");
+  assert.equal(mLash.msg.stage, "write", "gap test: Last Lash starts with a write stage");
+
+  // Players 1..4 submit a Last Lash answer. Player 5 stays connected (still
+  // "used") but deliberately never submits -- that's the exact silent-but-
+  // connected shape the pre-fix check let through. The write-stage deadline
+  // (not punchLashAllWritten, since player 5 never writes) is what moves this
+  // to voting.
+  const silent = n;
+  for (const pid of ids.filter((p) => p !== silent)) {
+    outG = eg.input(pid, { t: "quip", n: 0, text: "lash gap ans " + pid });
+  }
+  const mStillWriting = lastToWs(outG, 1, "punch");
+  assert.equal(mStillWriting.msg.stage, "write", "gap test: still writing -- player " + silent + " hasn't submitted");
+  const writeDurMs = mStillWriting.msg.dur * 1000;
+  for (let ms = 0; ms <= writeDurMs; ms += 5000) {
+    outG = outG.concat(eg.tick(mStillWriting.msg.deadline - writeDurMs + ms));
+  }
+  const mVoteG = lastToWs(outG, 1, "punch");
+  assert.equal(mVoteG.msg.stage, "vote", "gap test: write deadline moves on even though player " + silent + " never wrote");
+  assert.equal(mVoteG.msg.answers.length, n - 1, "gap test: only the " + (n - 1) + " who wrote have answer cards");
+  assert.ok(
+    !mVoteG.msg.answers.some((a) => a.pid === silent),
+    "gap test: the silent player has no answer card at all",
+  );
+
+  // The crafted frame: some other connected voter tries to vote for the silent
+  // player's pid directly (bypassing the UI, which could never construct this
+  // vote since it only reads targets from m.answers). Their votesLeft must NOT
+  // decrease -- the vote must be rejected outright, not merely uncounted.
+  const attacker = ids.find((p) => p !== silent);
+  const attackerBefore = lastToWs(outG, attacker, "punch");
+  const beforeVotesLeft = attackerBefore.msg.votesLeft;
+  const afterCraftedVote = eg.input(attacker, { t: "lashvote", target: silent, on: true });
+  // A rejected vote is a silent no-op: no message should even be pushed for it.
+  assert.equal(afterCraftedVote.length, 0, "gap test: a vote for a never-submitted target must be a silent no-op");
+  const attackerAfter = lastToWs(outG.concat(afterCraftedVote), attacker, "punch");
+  assert.equal(
+    attackerAfter.msg.votesLeft,
+    beforeVotesLeft,
+    "gap test: the attacker's votesLeft must not decrease from the rejected vote",
+  );
+
+  // Now have everyone who actually has an answer cast their 3 legitimate votes
+  // across the other real answers (never targeting the silent player, never
+  // self-voting), reveal, and prove the pool still sums to exactly 3000 -- i.e.
+  // the silent player's pid never received any share of it.
+  //
+  // punchLashAllVoted() gates reveal on every CONNECTED player's vote budget
+  // (_p[i].used), not just the ones who actually wrote an answer -- so the
+  // silent player (connected, never wrote, and thus has no answer to vote from
+  // in the real UI) still counts toward that denominator and never spends their
+  // budget. This is the exact "used but non-contributing player" shape Task 9's
+  // disconnect-denominator fix targeted, from the Last-Lash-vote angle instead
+  // of the disconnect angle: reveal here can only be reached via the vote
+  // deadline, not via all-voted -- which is itself a proof that a silent
+  // connected player doesn't get silently excluded from the denominator.
+  const real = ids.filter((p) => p !== silent);
+  const mVoteBeforeReal = lastToWs(outG, real[0], "punch");
+  for (const voter of real) {
+    const targets = real.filter((p) => p !== voter);
+    for (const target of targets) outG = eg.input(voter, { t: "lashvote", target, on: true });
+  }
+  const mStillVoting = lastToWs(outG, real[0], "punch");
+  assert.equal(mStillVoting.msg.stage, "vote", "gap test: silent player " + silent + " still owes votes -- all-voted must not fire early");
+  const voteDurMs = mVoteBeforeReal.msg.dur * 1000;
+  for (let ms = 0; ms <= voteDurMs; ms += 1000) {
+    outG = outG.concat(eg.tick(mVoteBeforeReal.msg.deadline - voteDurMs + ms));
+  }
+  const revG = lastToWs(outG, real[0], "punch");
+  assert.equal(revG.msg.stage, "reveal", "gap test: reveal fires once the Last Lash vote deadline passes");
+  assert.equal(revG.msg.answers.length, n - 1, "gap test: reveal still only lists the " + (n - 1) + " real answers");
+  assert.ok(
+    !revG.msg.answers.some((a) => a.pid === silent),
+    "gap test: silent player still absent from the reveal -- never got a pid-keyed payout slot",
+  );
+  const gainSumG = revG.msg.answers.reduce((sum, a) => sum + a.gain, 0);
+  assert.equal(gainSumG, 3000, "gap test: pool still sums to exactly 3000 -- the silent player's pid received no share");
+
+  console.log("punchline: Last Lash vote-for-non-submitter rejection (Fix 3) check passed");
+}

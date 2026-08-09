@@ -7,6 +7,8 @@
   var myready = false;
   var writtenSlots = {}; // n -> true, so a submitted textarea doesn't resubmit
   var lastWriteRound = -1; // reset writtenSlots whenever a new round's write stage begins
+  var writeCards = {}; // n -> card element, so an in-progress textarea from ANOTHER
+  // player's broadcast isn't wiped out mid-round (see renderWrite)
 
   function sub(name) {
     ["lobby", "count", "write", "vote", "final"].forEach(function (id) {
@@ -39,18 +41,41 @@
 
   function renderWrite(m) {
     sub("write");
-    if (m.round !== lastWriteRound) { writtenSlots = {}; lastWriteRound = m.round; }
+    var box = $("punch-prompts");
+    // A `punch` message broadcasts on EVERY player's partial submission (up to ~2N
+    // times in one write window), not just when something changes for THIS player.
+    // Wiping and rebuilding box on every call would blow away every other player's
+    // still-open, half-typed textarea (and blur their keyboard on mobile). So we only
+    // ever clear+rebuild when a genuinely new round starts; otherwise each prompt slot
+    // keeps its own DOM node across renders, tracked in writeCards, and is only ever
+    // touched again to swap it to the "sent" view once, the moment it becomes done.
+    if (m.round !== lastWriteRound) { writtenSlots = {}; lastWriteRound = m.round; writeCards = {}; box.innerHTML = ""; }
     A.timebar("punch-bar", m.deadline, m.dur, true);
     $("punch-write-meta").textContent = "Раунд " + m.round + " из " + m.rounds;
-    var box = $("punch-prompts");
-    box.innerHTML = "";
+    var sentHtml = function (p) {
+      return '<p class="punch-prompt">' + esc(p.text) + '</p><p class="punch-sent">Отправлено &#10003;</p>';
+    };
     var list = m.lash ? [{ n: 0, text: m.prompt, done: m.done }] : m.prompts;
     (list || []).forEach(function (p) {
       var already = writtenSlots[p.n] || p.done;
-      var card = document.createElement("div");
+      var card = writeCards[p.n];
+      if (card) {
+        // Already rendered this slot. Only touch it if it just became done and
+        // hasn't been swapped to the "sent" view yet -- otherwise leave the DOM
+        // (including any live typing/focus in its textarea) completely alone.
+        if (already && !card.dataset.sent) {
+          card.innerHTML = sentHtml(p);
+          card.dataset.sent = "1";
+        }
+        return;
+      }
+      // First time we've seen this slot this round: create its card.
+      card = document.createElement("div");
       card.className = "punch-card";
+      writeCards[p.n] = card;
       if (already) {
-        card.innerHTML = '<p class="punch-prompt">' + esc(p.text) + '</p><p class="punch-sent">Отправлено &#10003;</p>';
+        card.innerHTML = sentHtml(p);
+        card.dataset.sent = "1";
         box.appendChild(card);
         return;
       }
@@ -70,7 +95,8 @@
         A.sfx("buzz"); A.vibe(15);
         send({ t: "quip", n: p.n, text: text });
         writtenSlots[p.n] = true;
-        card.innerHTML = '<p class="punch-prompt">' + esc(p.text) + '</p><p class="punch-sent">Отправлено &#10003;</p>';
+        card.innerHTML = sentHtml(p);
+        card.dataset.sent = "1";
       });
     });
   }
@@ -146,7 +172,7 @@
   A.handlers.punch = function (m) {
     route("punch");
     if (A.view !== "punch") return;
-    if (m.phase === "lobby") { writtenSlots = {}; lastWriteRound = -1; renderLobby(m); }
+    if (m.phase === "lobby") { writtenSlots = {}; lastWriteRound = -1; writeCards = {}; renderLobby(m); }
     else if (m.phase === "countdown") renderCount(m);
     else if (m.phase === "play" && m.stage === "write") renderWrite(m);
     else if (m.phase === "play") renderVote(m);

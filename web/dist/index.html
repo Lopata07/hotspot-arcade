@@ -3498,6 +3498,7 @@ $("chess-promo").addEventListener("click", function (e) { if (e.target === $("ch
 var myready = false;
 var writtenSlots = {}; // n -> true, so a submitted textarea doesn't resubmit
 var lastWriteRound = -1; // reset writtenSlots whenever a new round's write stage begins
+var writeCards = {}; // n -> card element, so an in-progress textarea from ANOTHER
 function sub(name) {
 ["lobby", "count", "write", "vote", "final"].forEach(function (id) {
 $("punch-" + id).classList.toggle("hide", id !== name);
@@ -3521,18 +3522,30 @@ A.countdown("punch-count-num", m.sec);
 }
 function renderWrite(m) {
 sub("write");
-if (m.round !== lastWriteRound) { writtenSlots = {}; lastWriteRound = m.round; }
+var box = $("punch-prompts");
+if (m.round !== lastWriteRound) { writtenSlots = {}; lastWriteRound = m.round; writeCards = {}; box.innerHTML = ""; }
 A.timebar("punch-bar", m.deadline, m.dur, true);
 $("punch-write-meta").textContent = "Раунд " + m.round + " из " + m.rounds;
-var box = $("punch-prompts");
-box.innerHTML = "";
+var sentHtml = function (p) {
+return '<p class="punch-prompt">' + esc(p.text) + '</p><p class="punch-sent">Отправлено &#10003;</p>';
+};
 var list = m.lash ? [{ n: 0, text: m.prompt, done: m.done }] : m.prompts;
 (list || []).forEach(function (p) {
 var already = writtenSlots[p.n] || p.done;
-var card = document.createElement("div");
+var card = writeCards[p.n];
+if (card) {
+if (already && !card.dataset.sent) {
+card.innerHTML = sentHtml(p);
+card.dataset.sent = "1";
+}
+return;
+}
+card = document.createElement("div");
 card.className = "punch-card";
+writeCards[p.n] = card;
 if (already) {
-card.innerHTML = '<p class="punch-prompt">' + esc(p.text) + '</p><p class="punch-sent">Отправлено &#10003;</p>';
+card.innerHTML = sentHtml(p);
+card.dataset.sent = "1";
 box.appendChild(card);
 return;
 }
@@ -3552,7 +3565,8 @@ if (!text) return;
 A.sfx("buzz"); A.vibe(15);
 send({ t: "quip", n: p.n, text: text });
 writtenSlots[p.n] = true;
-card.innerHTML = '<p class="punch-prompt">' + esc(p.text) + '</p><p class="punch-sent">Отправлено &#10003;</p>';
+card.innerHTML = sentHtml(p);
+card.dataset.sent = "1";
 });
 });
 }
@@ -3623,7 +3637,7 @@ A.sfx("win"); A.vibe([20, 40, 20]);
 A.handlers.punch = function (m) {
 route("punch");
 if (A.view !== "punch") return;
-if (m.phase === "lobby") { writtenSlots = {}; lastWriteRound = -1; renderLobby(m); }
+if (m.phase === "lobby") { writtenSlots = {}; lastWriteRound = -1; writeCards = {}; renderLobby(m); }
 else if (m.phase === "countdown") renderCount(m);
 else if (m.phase === "play" && m.stage === "write") renderWrite(m);
 else if (m.phase === "play") renderVote(m);
