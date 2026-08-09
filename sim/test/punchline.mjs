@@ -101,3 +101,26 @@ for (const pid of [1, 2, 3, 4]) {
 }
 
 console.log("punchline: write stage + truncation + timeout checks passed");
+
+// Vote every pair in round 1. 4 players -> 4 pairs, 2 eligible voters each.
+for (let match = 0; match < 4; match++) {
+  const voters = [1, 2, 3, 4].filter((pid) => {
+    const m = lastToWs(out, pid, "punch");
+    return m.msg.stage === "vote" && m.msg.match === match && !m.msg.iam;
+  });
+  assert.equal(voters.length, 2, "2 eligible voters for match " + match);
+  out = e.input(voters[0], { t: "pick", n: 0 }); // both vote A: a unanimous pair
+  out = e.input(voters[1], { t: "pick", n: 0 });
+  const rev = lastToWs(out, voters[0], "punch");
+  assert.equal(rev.msg.stage, "reveal", "reveal fires once both eligible voters picked");
+  assert.equal(rev.msg.votesA, 2, "both votes landed on A");
+  assert.ok(rev.msg.gainA >= 1000 + 100 + 250, "unanimous A gets 100%+win+bonus (got " + rev.msg.gainA + ")");
+  assert.equal(rev.msg.gainB, 0, "B got no votes, no points");
+  for (let ms = 0; ms < 5500; ms += 500) out = out.concat(e.tick(rev.msg.deadline - 5000 + ms));
+}
+// After all 4 pairs, round 2 should have started (a fresh write stage, round 2).
+const m2 = lastToWs(out, 1, "punch");
+assert.equal(m2.msg.stage, "write", "round 2 opens with a fresh write stage");
+assert.equal(m2.msg.round, 2, "advanced to round 2");
+
+console.log("punchline: round 1 voting, reveal, and scoring checks passed");

@@ -877,6 +877,8 @@ public:
                             // un-clipped source to do its job
             if(ha_json_int(json, "n", &n) && ha_json_str(json, "text", txt, sizeof(txt)))
                 punchAnswer(pid, n, txt);
+        } else if(strcmp(type, "pick") == 0 && ha_json_int(json, "n", &v)) {
+            punchPick(pid, v);
         } else if(strcmp(type, "again") == 0) {
             triviaAgain(pid);
             drawAgain(pid);

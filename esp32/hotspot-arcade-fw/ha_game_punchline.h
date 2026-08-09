@@ -258,6 +258,71 @@ void punchStartVoting(uint32_t now) {
     pushAll();
 }
 
+void punchPick(uint8_t pid, int choice) {
+    if(_active != HA_GAME_PUNCHLINE || _punch.pt.phase != 2 || _punch.stage != 1) return;
+    if(_punch.pt.round >= PUNCH_ROUNDS) return; // Last Lash uses punchLashVote (Task 9)
+    if(_punch.pairRevealing) return;
+    if(choice != 0 && choice != 1) return;
+    PunchPair& pr = _punch.pairs[_punch.matchIdx];
+    if(pid == pr.a || pid == pr.b) return; // authors don't vote on their own pair
+    _punch.pick[pid] = (int8_t)choice;
+    if(punchPairAllVoted()) punchRevealPair(millis());
+    else pushAll();
+}
+
+int punchPairEligibleVoters() {
+    PunchPair& pr = _punch.pairs[_punch.matchIdx];
+    int n = 0;
+    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
+        if(_p[i].used && i != pr.a && i != pr.b) n++;
+    return n;
+}
+
+bool punchPairAllVoted() {
+    int need = punchPairEligibleVoters();
+    if(need == 0) return true; // floor of 3 players makes this unreachable in practice
+    PunchPair& pr = _punch.pairs[_punch.matchIdx];
+    int have = 0;
+    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
+        if(_p[i].used && i != pr.a && i != pr.b && _punch.pick[i] >= 0) have++;
+    return have >= need;
+}
+
+// mult is 10 in round 1, 20 in round 2 -- "round 2 doubles everything" falls out
+// of this one number rather than being a second scoring path.
+void punchRevealPair(uint32_t now) {
+    PunchPair& pr = _punch.pairs[_punch.matchIdx];
+    pr.votesA = 0;
+    pr.votesB = 0;
+    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
+        if(!_p[i].used || i == pr.a || i == pr.b) continue;
+        if(_punch.pick[i] == 0) pr.votesA++;
+        else if(_punch.pick[i] == 1) pr.votesB++;
+    }
+    int total = pr.votesA + pr.votesB;
+    int mult = (_punch.pt.round == 2) ? 20 : 10;
+    int ptsA = 0, ptsB = 0;
+    if(total > 0) {
+        int pctA = (pr.votesA * 100 + total / 2) / total;
+        int pctB = 100 - pctA;
+        ptsA = pctA * mult;
+        ptsB = pctB * mult;
+        if(pr.votesA > pr.votesB) ptsA += 10 * mult; // "+100 win" at mult 10, +200 at mult 20
+        else if(pr.votesB > pr.votesA) ptsB += 10 * mult;
+        if(total >= 2 && pr.votesA == total) ptsA += PUNCH_UNANIMOUS_BONUS;
+        if(total >= 2 && pr.votesB == total) ptsB += PUNCH_UNANIMOUS_BONUS;
+        _p[pr.a].score += ptsA;
+        _p[pr.b].score += ptsB;
+        if(ptsA) haUartScore(pr.a, ptsA, "punchline");
+        if(ptsB) haUartScore(pr.b, ptsB, "punchline");
+    }
+    _punch.gained[pr.a] = ptsA;
+    _punch.gained[pr.b] = ptsB;
+    _punch.pairRevealing = true;
+    _punch.pt.revealUntil = now + PUNCH_REVEAL_MS;
+    pushAll();
+}
+
 // Round advance dispatcher. Rounds 1-2 build a fresh pairing; round 3 hands off to
 // Task 9's punchBuildLash(); past round 3, the game is over.
 void punchNextRound(uint32_t now) {
@@ -291,6 +356,24 @@ void punchTick(uint32_t now) {
         // Deadline hit: unwritten slots simply stay "" (inA/inB stay false, which
         // punchRevealPair in Task 8 treats as a zero-vote-eligible empty answer).
         if((int32_t)(now - pt.deadline) >= 0) punchStartVoting(now);
+        return;
+    }
+
+    // stage 1: voting on, or showing the result of, the pair at matchIdx.
+    if(!_punch.pairRevealing) {
+        if((int32_t)(now - pt.deadline) >= 0 || punchPairAllVoted()) punchRevealPair(now);
+        return;
+    }
+    if((int32_t)(now - pt.revealUntil) >= 0) {
+        _punch.matchIdx++;
+        if(_punch.matchIdx >= _punch.pairCount) {
+            punchNextRound(now);
+        } else {
+            _punch.pairRevealing = false;
+            for(int i = 0; i <= HA_MAX_PLAYERS; i++) _punch.pick[i] = -1;
+            pt.deadline = now + (uint32_t)PUNCH_VOTE_SECS * 1000;
+            pushAll();
+        }
     }
 }
 
@@ -345,12 +428,26 @@ String punchJson(uint8_t pid) {
         return s;
     }
 
-    // stage 1 (vote): placeholder shape until Task 8 adds picking/reveal/scoring.
+    // stage 1: voting on (or revealing) the pair at matchIdx.
     PunchPair& pr = _punch.pairs[_punch.matchIdx];
     bool mine = (pid == pr.a || pid == pr.b);
-    String s = String("{\"t\":\"punch\",\"phase\":\"play\",\"stage\":\"vote\",\"round\":") +
-               pt.round + ",\"rounds\":" + PUNCH_ROUNDS + ",\"you\":" + pid +
-               ",\"match\":" + _punch.matchIdx + ",\"matches\":" + _punch.pairCount +
-               ",\"iam\":" + (mine ? "true" : "false") + "}";
+    bool reveal = _punch.pairRevealing;
+    String s = String("{\"t\":\"punch\",\"phase\":\"play\",\"round\":") + pt.round +
+               ",\"rounds\":" + PUNCH_ROUNDS + ",\"you\":" + pid + ",\"stage\":\"" +
+               (reveal ? "reveal" : "vote") + "\",\"match\":" + _punch.matchIdx +
+               ",\"matches\":" + _punch.pairCount + ",\"iam\":" + (mine ? "true" : "false") +
+               ",\"a\":\"" + ha_json_escape(pr.textA[0] ? pr.textA : "...") + "\",\"b\":\"" +
+               ha_json_escape(pr.textB[0] ? pr.textB : "...") + "\"";
+    if(!mine && !reveal) s += ",\"mypick\":" + String((int)_punch.pick[pid]);
+    if(reveal) {
+        s += ",\"votesA\":" + String(pr.votesA) + ",\"votesB\":" + String(pr.votesB) +
+             ",\"nickA\":\"" + ha_json_escape(_p[pr.a].nick) + "\",\"nickB\":\"" +
+             ha_json_escape(_p[pr.b].nick) + "\",\"gainA\":" + _punch.gained[pr.a] +
+             ",\"gainB\":" + _punch.gained[pr.b] + ",\"deadline\":" + String(pt.revealUntil) +
+             ",\"dur\":" + String(PUNCH_REVEAL_MS / 1000);
+    } else {
+        s += ",\"deadline\":" + String(pt.deadline) + ",\"dur\":" + String(PUNCH_VOTE_SECS);
+    }
+    s += ",\"scores\":" + playersJson() + "}";
     return s;
 }
