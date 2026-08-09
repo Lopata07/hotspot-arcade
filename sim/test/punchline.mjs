@@ -268,25 +268,16 @@ console.log("punchline: round 1 voting, reveal, and scoring checks passed");
   console.log("punchline: N=3 single-voter unanimous-suppression check passed");
 }
 
-// Round 2: same shape as round 1 (already proven above), skip to round 3 by
-// voting every pair the same way (unanimous A each time).
-for (let match = 0; match < 4; match++) {
-  const voters = [1, 2, 3, 4].filter((pid) => {
-    const m = lastToWs(out, pid, "punch");
-    return m.msg.stage === "write";
-  });
-  // still in write for round 2: everyone answers both prompts first.
-  if (voters.length === 4 && match === 0) {
-    for (const pid of [1, 2, 3, 4]) {
-      const m = lastToWs(out, pid, "punch");
-      for (const p of m.msg.prompts) out = e.input(pid, { t: "quip", n: p.n, text: "r2 " + pid + "/" + p.n });
-    }
-  }
+// Round 2: same shape as round 1 (already proven above). Match 0 was already
+// played out and ticked past its reveal above (the "round 2 multiplier check"
+// block), so finish matches 1-3 here -- writing was already done for all of round
+// 2 in that same block, so there's no write-stage branch to fall back into.
+for (let match = 1; match < 4; match++) {
   const eligible = [1, 2, 3, 4].filter((pid) => {
     const m = lastToWs(out, pid, "punch");
     return m.msg.stage === "vote" && m.msg.match === match && !m.msg.iam;
   });
-  if (eligible.length !== 2) continue; // already past this match (shouldn't happen, but don't hang the test)
+  assert.equal(eligible.length, 2, "match " + match + " should have exactly 2 eligible voters");
   out = e.input(eligible[0], { t: "pick", n: 0 });
   out = e.input(eligible[1], { t: "pick", n: 0 });
   const rev = lastToWs(out, eligible[0], "punch");
@@ -316,7 +307,27 @@ const rev3 = lastToWs(out, 1, "punch");
 assert.equal(rev3.msg.stage, "reveal", "Last Lash reveals once everyone used all 3 votes");
 const p1 = rev3.msg.answers.find((a) => a.pid === 1);
 assert.equal(p1.votes, 3, "player 1 got a vote from everyone else (3)");
-assert.ok(p1.gain > 0, "player 1 earned a pool share");
+// Exact share, not just ">0": with 4 players, totalVotes=12 and every player's tally=3
+// (each of the other 3 casts exactly one vote for them), so the pool math is fully
+// determined: (3000*3 + 12/2) / 12 = 750 for every player, summing to exactly 3000 --
+// a wrong formula, wrong rounding, or a stray bonus couldn't accidentally satisfy this.
+assert.equal(p1.gain, 750, "player 1's exact pool share");
+const gainSum = rev3.msg.answers.reduce((sum, a) => sum + a.gain, 0);
+assert.equal(gainSum, 3000, "all 4 players' pool shares sum to exactly the 3000-point pool");
+
+// Critical-fix regression: a vote message that arrives during the reveal window
+// (pairRevealing already true) must not be able to reopen voting and pay the pool
+// out a second time -- punchLashVote() must guard on _punch.pairRevealing exactly
+// like punchPick() already does for rounds 1-2.
+const replayDrain1 = e.input(1, { t: "lashvote", target: 2, on: false }); // toggle off
+const replayDrain2 = e.input(1, { t: "lashvote", target: 2, on: true }); // toggle back on
+assert.equal(replayDrain1.length, 0, "a vote during the reveal window must be a silent no-op");
+assert.equal(replayDrain2.length, 0, "toggling back on during the reveal window must also no-op");
+const rev3b = lastToWs(out, 1, "punch");
+assert.equal(rev3b.msg.stage, "reveal", "still the same reveal -- state must be unaffected by the stray vote");
+assert.equal(rev3b.msg.deadline, rev3.msg.deadline, "reveal window must not be extended by a stray vote");
+const p1b = rev3b.msg.answers.find((a) => a.pid === 1);
+assert.equal(p1b.gain, 750, "pool share must not be paid out a second time");
 
 for (let ms = 0; ms < 9000; ms += 1000) out = out.concat(e.tick(rev3.msg.deadline - 8000 + ms));
 const fin = lastToWs(out, 1, "punch");

@@ -400,6 +400,8 @@ void punchStartLashVoting(uint32_t now) {
 void punchLashVote(uint8_t pid, uint8_t target, bool on) {
     if(_active != HA_GAME_PUNCHLINE || _punch.pt.phase != 2 || _punch.stage != 1) return;
     if(_punch.pt.round < PUNCH_ROUNDS) return;
+    if(_punch.pairRevealing) return; // reveal already fired -- a late/replayed vote must not
+                                      // be able to reopen scoring and pay the pool out again
     if(target < 1 || target > HA_MAX_PLAYERS || !_p[target].used || target == pid) return;
     bool have = _punch.lashVotedFor[pid][target];
     if(on == have) return;
@@ -430,7 +432,11 @@ bool punchLashAllVoted() {
 void punchRevealLash(uint32_t now) {
     int totalVotes = 0;
     for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
-        if(_p[i].used) totalVotes += _punch.lashVotesUsed[i];
+        totalVotes += _punch.lashVotesUsed[i]; // no `if(_p[i].used)` filter -- a departed
+                                                 // player's already-cast votes are still real
+                                                 // votes counted in some target's lashTally, so
+                                                 // the denominator must match that numerator
+                                                 // regardless of current connection state
     for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
         if(!_p[i].used) {
             _punch.gained[i] = 0;
