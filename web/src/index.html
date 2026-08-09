@@ -481,6 +481,43 @@
   </div>
 </section>
 
+<!-- 17. Punchline (Смехлыст) -- Quiplash-style write-then-vote. UI text is
+     hardcoded Russian, not routed through core/i18n.js -- this is a personal-fork
+     game, not an upstream one, so it does not carry en/de/pt-br translations like
+     the other 15 do. Flipper-side labels stay Latin (Punchline) -- see Task 11 --
+     because the Flipper's font can't render Cyrillic; only this phone screen is
+     Russian. -->
+<section id="punch" class="screen hide">
+  <div id="punch-lobby" class="hide">
+    <header class="bar"><h2>Смехлыст</h2><span id="punch-me" class="me"></span></header>
+    <ul id="punch-players" class="players"></ul>
+    <button id="punch-ready" class="btn big">Готов</button>
+    <p class="sub">Голосуй за пак</p>
+    <div id="punch-topics" class="topics"></div>
+  </div>
+  <div id="punch-count" class="hide count">
+    <div class="count-topic">Смехлыст</div>
+    <div id="punch-count-num" class="count-num">3</div>
+    <div class="sub">Начинаем</div>
+  </div>
+  <div id="punch-write" class="hide">
+    <div class="bar"><span id="punch-write-meta" class="me"></span></div>
+    <div id="punch-bar" class="timebar hide"><i></i></div>
+    <div id="punch-prompts" class="punch-prompts"></div>
+  </div>
+  <div id="punch-vote" class="hide">
+    <div class="bar"><span id="punch-vote-meta" class="me"></span></div>
+    <div id="punch-vote-bar" class="timebar hide"><i></i></div>
+    <p id="punch-vote-prompt" class="sub"></p>
+    <div id="punch-cards" class="punch-cards"></div>
+  </div>
+  <div id="punch-final" class="hide">
+    <header class="bar"><h2>Итоги</h2></header>
+    <ol id="punch-podium" class="podium"></ol>
+    <button id="punch-again" class="btn big">Играть снова</button>
+  </div>
+</section>
+
 <!-- Emoji reactions: floating layer + a corner button that opens the emoji row -->
 <div id="react-layer" class="react-layer" aria-hidden="true"></div>
 <div id="react-bar" class="react-bar hide">

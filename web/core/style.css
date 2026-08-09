@@ -692,3 +692,26 @@ h3{margin:0; font-weight:600}
   font-size:30px; background:var(--surface-2); border:2px solid var(--line);
   border-radius:var(--radius); color:var(--text)}
 .ch-promo-btn:active{border-color:var(--orange); transform:translateY(1px)}
+
+.punch-prompts,.punch-cards{display:flex; flex-direction:column; gap:12px; margin:6px 0}
+.punch-card{background:var(--surface); border:2px solid var(--line); border-radius:var(--radius);
+  padding:12px; text-align:left}
+.punch-prompt{font-weight:700; margin:0 0 8px}
+.punch-textarea{width:100%; box-sizing:border-box; font-family:var(--font); font-size:15px;
+  background:var(--surface-2); border:2px solid var(--line); border-radius:var(--radius);
+  color:var(--text); padding:8px; resize:none; min-height:64px}
+.punch-textarea:focus{border-color:var(--orange); outline:none}
+.punch-row{display:flex; align-items:center; justify-content:space-between; margin-top:8px}
+.punch-count{color:var(--text-dim); font-variant-numeric:tabular-nums; font-size:13px}
+.punch-sent{color:var(--orange); font-weight:700; margin:0}
+.punch-card.vote-opt{cursor:pointer}
+.punch-card.vote-opt:active{transform:translateY(1px); border-color:var(--orange)}
+.punch-card.mine{border-color:var(--orange)}
+.punch-ans{margin:0; font-size:16px}
+.punch-votes{display:block; margin-top:8px; color:var(--orange); font-weight:700;
+  font-variant-numeric:tabular-nums; font-size:13px}
+.punch-card.lash{cursor:pointer}
+.punch-card.lash.self{opacity:.6; cursor:default}
+.punch-nick{display:block; font-weight:700; font-size:13px; color:var(--text-dim);
+  text-transform:uppercase; letter-spacing:.04em; margin-bottom:4px}
+.punch-tap{display:block; margin-top:8px; color:var(--text-dim); font-size:13px}
