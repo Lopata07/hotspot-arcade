@@ -872,13 +872,17 @@ public:
                 kmkAssign(pid, k, m, x);
         } else if(strcmp(type, "quip") == 0) {
             int n;
-            char txt[300]; // wider than PUNCH_ANSWER_BYTES on purpose -- see punchAnswer()'s
-                            // comment for why: the truncation logic needs to see the full,
-                            // un-clipped source to do its job
-            if(ha_json_int(json, "n", &n) && ha_json_str(json, "text", txt, sizeof(txt)))
-                punchAnswer(pid, n, txt);
+            char txt[300]; // wider than PUNCH_ANSWER_BYTES -- see punchAnswer()'s comment
+            if(ha_json_int(json, "n", &n) && ha_json_str(json, "text", txt, sizeof(txt))) {
+                if(_punch.pt.round < PUNCH_ROUNDS) punchAnswer(pid, n, txt);
+                else punchLashAnswer(pid, txt);
+            }
         } else if(strcmp(type, "pick") == 0 && ha_json_int(json, "n", &v)) {
             punchPick(pid, v);
+        } else if(strcmp(type, "lashvote") == 0 && ha_json_int(json, "target", &v)) {
+            const char* onp = ha_json_find(json, "on");
+            bool on = !onp || strncmp(onp, "true", 4) == 0; // default true: "vote for" is the common case
+            punchLashVote(pid, (uint8_t)v, on);
         } else if(strcmp(type, "again") == 0) {
             triviaAgain(pid);
             drawAgain(pid);
@@ -888,6 +892,7 @@ public:
             gcAgain(pid);
             spectrumAgain(pid);
             kmkAgain(pid);
+            punchAgain(pid);
         } else if(strcmp(type, "say") == 0) {
             char t[120];
             if(ha_json_str(json, "text", t, sizeof(t))) onSay(pid, t);

@@ -324,7 +324,7 @@ void punchRevealPair(uint32_t now) {
 }
 
 // Round advance dispatcher. Rounds 1-2 build a fresh pairing; round 3 hands off to
-// Task 9's punchBuildLash(); past round 3, the game is over.
+// punchBuildLash(); past round 3, the game is over.
 void punchNextRound(uint32_t now) {
     Party& pt = _punch.pt;
     if(pt.round >= PUNCH_ROUNDS) {
@@ -333,11 +333,133 @@ void punchNextRound(uint32_t now) {
         return;
     }
     pt.round++;
-    punchBuildPairs(now); // Task 9 branches this to punchBuildLash() on round 3
+    if(pt.round < PUNCH_ROUNDS) punchBuildPairs(now);
+    else punchBuildLash(now); // round 3: Last Lash
+}
+
+void punchBuildLash(uint32_t now) {
+    Party& pt = _punch.pt;
+    WordPack& pk = _punch.packs[_punch.pack];
+    if(pk.count == 0) {
+        pt.phase = 4;
+        pushAll();
+        return;
+    }
+    const String& p = pk.words[_punch.promptSeq % pk.count];
+    strlcpy(_punch.lashPrompt, p.c_str(), sizeof(_punch.lashPrompt));
+    _punch.promptSeq++;
+
+    for(int i = 0; i <= HA_MAX_PLAYERS; i++) {
+        _punch.lashIn[i] = false;
+        _punch.lashText[i][0] = '\0';
+        _punch.lashVotesUsed[i] = 0;
+        _punch.lashTally[i] = 0;
+        _punch.gained[i] = 0;
+        for(int j = 0; j <= HA_MAX_PLAYERS; j++) _punch.lashVotedFor[i][j] = false;
+    }
+    _punch.stage = 0;
+    _punch.pairRevealing = false;
+    pt.deadline = now + (uint32_t)PUNCH_WRITE_SECS * 1000;
+    pt.phase = 2;
+    pushAll();
+}
+
+// Same truncate-before-copy ordering as punchAnswer() (see that function's comment
+// and the Task 7 correction note it links to): text is truncated in a wider-than-
+// PUNCH_ANSWER_BYTES scratch buffer BEFORE the final bounded copy into
+// _punch.lashText[pid], not after -- copying into the final-size buffer first would
+// make punchUtf8Truncate's "was this truncated" check permanently unreachable.
+void punchLashAnswer(uint8_t pid, const char* text) {
+    if(_active != HA_GAME_PUNCHLINE || _punch.pt.phase != 2 || _punch.stage != 0) return;
+    if(_punch.pt.round < PUNCH_ROUNDS) return;
+    if(_punch.lashIn[pid]) return;
+    char tmp[300];
+    strlcpy(tmp, text, sizeof(tmp));
+    punchUtf8Truncate(tmp, PUNCH_ANSWER_BYTES);
+    strlcpy(_punch.lashText[pid], tmp, sizeof(_punch.lashText[pid]));
+    _punch.lashIn[pid] = true;
+    if(punchLashAllWritten()) punchStartLashVoting(millis());
+    else pushAll();
+}
+
+bool punchLashAllWritten() {
+    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
+        if(_p[i].used && !_punch.lashIn[i]) return false;
+    return true;
+}
+
+void punchStartLashVoting(uint32_t now) {
+    _punch.stage = 1;
+    _punch.pt.deadline = now + (uint32_t)PUNCH_LASH_VOTE_SECS * 1000;
+    pushAll();
+}
+
+// Toggle one of a player's 3 votes onto/off a target. Self-votes and over-budget
+// votes are silently ignored (not an error -- the client already prevents both,
+// this is the judge's own backstop against a hand-crafted WS frame).
+void punchLashVote(uint8_t pid, uint8_t target, bool on) {
+    if(_active != HA_GAME_PUNCHLINE || _punch.pt.phase != 2 || _punch.stage != 1) return;
+    if(_punch.pt.round < PUNCH_ROUNDS) return;
+    if(target < 1 || target > HA_MAX_PLAYERS || !_p[target].used || target == pid) return;
+    bool have = _punch.lashVotedFor[pid][target];
+    if(on == have) return;
+    if(on) {
+        if(_punch.lashVotesUsed[pid] >= PUNCH_LASH_VOTES) return;
+        _punch.lashVotedFor[pid][target] = true;
+        _punch.lashVotesUsed[pid]++;
+        _punch.lashTally[target]++;
+    } else {
+        _punch.lashVotedFor[pid][target] = false;
+        _punch.lashVotesUsed[pid]--;
+        _punch.lashTally[target]--;
+    }
+    if(punchLashAllVoted()) punchRevealLash(millis());
+    else pushAll();
+}
+
+bool punchLashAllVoted() {
+    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
+        if(_p[i].used && _punch.lashVotesUsed[i] < PUNCH_LASH_VOTES) return false;
+    return true;
+}
+
+// 3000-point pool split proportionally to votes received. No separate unanimous
+// bonus here -- an answer that gets every vote already earns the largest possible
+// pool share on its own, and stacking a flat +250 on top of a percentage-of-3000
+// payout would be a rounding error, not a meaningful bonus.
+void punchRevealLash(uint32_t now) {
+    int totalVotes = 0;
+    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
+        if(_p[i].used) totalVotes += _punch.lashVotesUsed[i];
+    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
+        if(!_p[i].used) {
+            _punch.gained[i] = 0;
+            continue;
+        }
+        int pts = totalVotes > 0
+                       ? (int)((3000L * _punch.lashTally[i] + totalVotes / 2) / totalVotes)
+                       : 0;
+        _punch.gained[i] = pts;
+        if(pts) {
+            _p[i].score += pts;
+            haUartScore(i, pts, "punchline");
+        }
+    }
+    _punch.pairRevealing = true; // reused as "showing the Last Lash result"
+    _punch.pt.revealUntil = now + PUNCH_LASH_REVEAL_MS;
+    pushAll();
+}
+
+void punchAgain(uint8_t pid) {
+    (void)pid;
+    if(_active != HA_GAME_PUNCHLINE || _punch.pt.phase != 4) return;
+    punchClear();
+    pushAll();
 }
 
 // Time-driven progression: lobby -> countdown -> round transition, plus the
-// write-stage deadline. The vote/reveal loop inside stage 1 is Tasks 8-9.
+// write-stage deadline. The vote/reveal loop inside stage 1 covers rounds 1-2 and
+// the Last Lash.
 void punchTick(uint32_t now) {
     Party& pt = _punch.pt;
     if(pt.phase == 1) {
@@ -350,31 +472,40 @@ void punchTick(uint32_t now) {
         return;
     }
     if(pt.phase != 2) return;
-    if(pt.round >= PUNCH_ROUNDS) return; // Last Lash tick is Task 9
 
-    if(_punch.stage == 0) {
-        // Deadline hit: unwritten slots simply stay "" (inA/inB stay false, which
-        // punchRevealPair in Task 8 treats as a zero-vote-eligible empty answer).
-        if((int32_t)(now - pt.deadline) >= 0) punchStartVoting(now);
-        return;
-    }
-
-    // stage 1: voting on, or showing the result of, the pair at matchIdx.
-    if(!_punch.pairRevealing) {
-        if((int32_t)(now - pt.deadline) >= 0 || punchPairAllVoted()) punchRevealPair(now);
-        return;
-    }
-    if((int32_t)(now - pt.revealUntil) >= 0) {
-        _punch.matchIdx++;
-        if(_punch.matchIdx >= _punch.pairCount) {
-            punchNextRound(now);
-        } else {
-            _punch.pairRevealing = false;
-            for(int i = 0; i <= HA_MAX_PLAYERS; i++) _punch.pick[i] = -1;
-            pt.deadline = now + (uint32_t)PUNCH_VOTE_SECS * 1000;
-            pushAll();
+    if(pt.round < PUNCH_ROUNDS) {
+        if(_punch.stage == 0) {
+            if((int32_t)(now - pt.deadline) >= 0) punchStartVoting(now);
+            return;
         }
+        if(!_punch.pairRevealing) {
+            if((int32_t)(now - pt.deadline) >= 0 || punchPairAllVoted()) punchRevealPair(now);
+            return;
+        }
+        if((int32_t)(now - pt.revealUntil) >= 0) {
+            _punch.matchIdx++;
+            if(_punch.matchIdx >= _punch.pairCount) {
+                punchNextRound(now);
+            } else {
+                _punch.pairRevealing = false;
+                for(int i = 0; i <= HA_MAX_PLAYERS; i++) _punch.pick[i] = -1;
+                pt.deadline = now + (uint32_t)PUNCH_VOTE_SECS * 1000;
+                pushAll();
+            }
+        }
+        return;
     }
+
+    // round 3: Last Lash
+    if(_punch.stage == 0) {
+        if((int32_t)(now - pt.deadline) >= 0) punchStartLashVoting(now);
+        return;
+    }
+    if(!_punch.pairRevealing) {
+        if((int32_t)(now - pt.deadline) >= 0 || punchLashAllVoted()) punchRevealLash(now);
+        return;
+    }
+    if((int32_t)(now - pt.revealUntil) >= 0) punchNextRound(now); // -> phase 4 final
 }
 
 // Lobby / countdown / write-stage (with live "done" tracking) / vote-stage
@@ -403,7 +534,13 @@ String punchJson(uint8_t pid) {
         return String("{\"t\":\"punch\",\"phase\":\"final\",\"you\":") + pid +
                ",\"scores\":" + playersJson() + "}";
 
-    // phase 2 (play): shape differs by stage.
+    // phase 2 (play): shape differs by round.
+    if(pt.round < PUNCH_ROUNDS) return punchPlayJson(pid);
+    return punchLashJson(pid);
+}
+
+String punchPlayJson(uint8_t pid) {
+    Party& pt = _punch.pt;
     if(_punch.stage == 0) {
         String s = String("{\"t\":\"punch\",\"phase\":\"play\",\"stage\":\"write\",\"round\":") +
                    pt.round + ",\"rounds\":" + PUNCH_ROUNDS + ",\"you\":" + pid +
@@ -428,7 +565,6 @@ String punchJson(uint8_t pid) {
         return s;
     }
 
-    // stage 1: voting on (or revealing) the pair at matchIdx.
     PunchPair& pr = _punch.pairs[_punch.matchIdx];
     bool mine = (pid == pr.a || pid == pr.b);
     bool reveal = _punch.pairRevealing;
@@ -448,6 +584,42 @@ String punchJson(uint8_t pid) {
     } else {
         s += ",\"deadline\":" + String(pt.deadline) + ",\"dur\":" + String(PUNCH_VOTE_SECS);
     }
+    s += ",\"scores\":" + playersJson() + "}";
+    return s;
+}
+
+String punchLashJson(uint8_t pid) {
+    Party& pt = _punch.pt;
+    String s = String("{\"t\":\"punch\",\"phase\":\"play\",\"round\":") + pt.round +
+               ",\"rounds\":" + PUNCH_ROUNDS + ",\"you\":" + pid + ",\"lash\":true,\"prompt\":\"" +
+               ha_json_escape(_punch.lashPrompt) + "\"";
+
+    if(_punch.stage == 0) {
+        s += ",\"stage\":\"write\",\"limit\":" + String(PUNCH_ANSWER_CHARS) + ",\"done\":" +
+             (_punch.lashIn[pid] ? "true" : "false") + ",\"deadline\":" + String(pt.deadline) +
+             ",\"dur\":" + String(PUNCH_WRITE_SECS) + "}";
+        return s;
+    }
+
+    bool reveal = _punch.pairRevealing;
+    s += ",\"stage\":\"" + String(reveal ? "reveal" : "vote") + "\",\"votesLeft\":" +
+         String(PUNCH_LASH_VOTES - _punch.lashVotesUsed[pid]) + ",\"answers\":[";
+    bool first = true;
+    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
+        if(!_p[i].used || !_punch.lashIn[i]) continue;
+        if(!first) s += ",";
+        first = false;
+        s += String("{\"pid\":") + i + ",\"nick\":\"" + ha_json_escape(_p[i].nick) +
+             "\",\"text\":\"" + ha_json_escape(_punch.lashText[i]) + "\",\"mine\":" +
+             (_punch.lashVotedFor[pid][i] ? "true" : "false");
+        if(reveal) s += ",\"votes\":" + String(_punch.lashTally[i]) + ",\"gain\":" + _punch.gained[i];
+        s += "}";
+    }
+    s += "]";
+    if(reveal)
+        s += ",\"deadline\":" + String(pt.revealUntil) + ",\"dur\":" + String(PUNCH_LASH_REVEAL_MS / 1000);
+    else
+        s += ",\"deadline\":" + String(pt.deadline) + ",\"dur\":" + String(PUNCH_LASH_VOTE_SECS);
     s += ",\"scores\":" + playersJson() + "}";
     return s;
 }

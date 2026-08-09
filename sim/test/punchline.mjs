@@ -149,6 +149,10 @@ console.log("punchline: round 1 voting, reveal, and scoring checks passed");
   assert.equal(revR2.msg.stage, "reveal", "round 2 reveal fires once both eligible voters picked");
   assert.equal(revR2.msg.gainA, 2450, "round 2 unanimous: 100%*20 + win 200 + flat unanimous 250 = 2450, not 2700");
   assert.equal(revR2.msg.gainB, 0, "round 2 B got no votes");
+  // Advance past match 0's reveal (this block only asserted the payout -- it never
+  // ticked the reveal window away) so the append below picks up at match 1 instead
+  // of finding this match forever stuck mid-reveal.
+  for (let ms = 0; ms < 5500; ms += 500) out = out.concat(e.tick(revR2.msg.deadline - 5000 + ms));
   console.log("punchline: round 2 multiplier check passed");
 }
 
@@ -263,3 +267,65 @@ console.log("punchline: round 1 voting, reveal, and scoring checks passed");
   assert.equal(revS.msg.gainB, 0, "N=3: B got no votes");
   console.log("punchline: N=3 single-voter unanimous-suppression check passed");
 }
+
+// Round 2: same shape as round 1 (already proven above), skip to round 3 by
+// voting every pair the same way (unanimous A each time).
+for (let match = 0; match < 4; match++) {
+  const voters = [1, 2, 3, 4].filter((pid) => {
+    const m = lastToWs(out, pid, "punch");
+    return m.msg.stage === "write";
+  });
+  // still in write for round 2: everyone answers both prompts first.
+  if (voters.length === 4 && match === 0) {
+    for (const pid of [1, 2, 3, 4]) {
+      const m = lastToWs(out, pid, "punch");
+      for (const p of m.msg.prompts) out = e.input(pid, { t: "quip", n: p.n, text: "r2 " + pid + "/" + p.n });
+    }
+  }
+  const eligible = [1, 2, 3, 4].filter((pid) => {
+    const m = lastToWs(out, pid, "punch");
+    return m.msg.stage === "vote" && m.msg.match === match && !m.msg.iam;
+  });
+  if (eligible.length !== 2) continue; // already past this match (shouldn't happen, but don't hang the test)
+  out = e.input(eligible[0], { t: "pick", n: 0 });
+  out = e.input(eligible[1], { t: "pick", n: 0 });
+  const rev = lastToWs(out, eligible[0], "punch");
+  for (let ms = 0; ms < 5500; ms += 500) out = out.concat(e.tick(rev.msg.deadline - 5000 + ms));
+}
+
+// Round 3, "Last Lash": one prompt, everyone writes, everyone gets 3 votes.
+let m3 = lastToWs(out, 1, "punch");
+assert.equal(m3.msg.round, 3, "round 3 reached");
+assert.equal(m3.msg.lash, true, "round 3 is flagged as the Last Lash");
+assert.equal(m3.msg.stage, "write", "Last Lash starts with a write stage");
+for (const pid of [1, 2, 3, 4]) out = e.input(pid, { t: "quip", n: 0, text: "lash answer " + pid });
+let mv = lastToWs(out, 1, "punch");
+assert.equal(mv.msg.stage, "vote", "Last Lash moves to voting once everyone wrote");
+assert.equal(mv.msg.answers.length, 4, "all 4 answers listed");
+
+// Everyone dumps all 3 votes onto player 1 (self-votes are rejected by the server,
+// so each voter's 3 targets come from the other 3 players -- for 4 players total
+// that's exactly "the other 3", so this also proves the self-vote rejection: a
+// vote for yourself must be silently ignored, not consume a vote slot).
+for (const voter of [1, 2, 3, 4]) {
+  out = e.input(voter, { t: "lashvote", target: voter, on: true }); // rejected: self-vote
+  const targets = [1, 2, 3, 4].filter((p) => p !== voter);
+  for (const target of targets) out = e.input(voter, { t: "lashvote", target, on: true });
+}
+const rev3 = lastToWs(out, 1, "punch");
+assert.equal(rev3.msg.stage, "reveal", "Last Lash reveals once everyone used all 3 votes");
+const p1 = rev3.msg.answers.find((a) => a.pid === 1);
+assert.equal(p1.votes, 3, "player 1 got a vote from everyone else (3)");
+assert.ok(p1.gain > 0, "player 1 earned a pool share");
+
+for (let ms = 0; ms < 9000; ms += 1000) out = out.concat(e.tick(rev3.msg.deadline - 8000 + ms));
+const fin = lastToWs(out, 1, "punch");
+assert.equal(fin.msg.phase, "final", "game ends after round 3's reveal");
+assert.ok(Array.isArray(fin.msg.scores) && fin.msg.scores.length === 4, "final has all 4 scores");
+
+// Again -> back to lobby.
+out = e.input(1, { t: "again" });
+const lob = lastToWs(out, 1, "punch");
+assert.equal(lob.msg.phase, "lobby", "again resets to the lobby");
+
+console.log("punchline: Last Lash, podium, and replay checks passed");
