@@ -16,7 +16,7 @@
 #define HA_FW_MAGIC_1 0x41 // 'A'
 #define HA_FW_MAGIC_2 0x52 // 'R'
 #define HA_FW_MAGIC_3 0x43 // 'C'  ("HARC" = Hotspot ARCade)
-#define HA_FW_VERSION 18 // v18: AP password + Punchline game added
+#define HA_FW_VERSION 19 // v19: RGB status LED (idle/open/protected)
 
 // Flipper -> ESP
 enum {

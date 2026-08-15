@@ -33,6 +33,40 @@ static uint8_t apMaxConn = AP_MAX_CONN;
 static AssetStore assets;
 static Engine engine;
 
+// ---------------- status LED ----------------
+// The official devboard carries an RGB LED wired to these three pins. They are not
+// documented in the Flipper hardware docs; the numbers come from the board's own
+// factory firmware (flipperdevices/blackmagic-esp32-s2, main/led.c), which is the
+// authoritative source for this board.
+//
+// Common anode: the pin sinks current, so a LOW duty lights the channel and the PWM
+// value has to be inverted. The factory firmware also caps brightness at 20/256 --
+// at full duty this LED is genuinely painful to look at on a desk. Same cap here.
+#define LED_PIN_RED   6
+#define LED_PIN_GREEN 5
+#define LED_PIN_BLUE  4
+#define LED_CH_RED    5 // LEDC channels 5-7: the engine uses none, so no conflict
+#define LED_CH_GREEN  6
+#define LED_CH_BLUE   7
+#define LED_MAX_DUTY  20 // of 255, matching the factory firmware's own cap
+
+static void ledInit() {
+    ledcSetup(LED_CH_RED, 5000, 8);
+    ledcSetup(LED_CH_GREEN, 5000, 8);
+    ledcSetup(LED_CH_BLUE, 5000, 8);
+    ledcAttachPin(LED_PIN_RED, LED_CH_RED);
+    ledcAttachPin(LED_PIN_GREEN, LED_CH_GREEN);
+    ledcAttachPin(LED_PIN_BLUE, LED_CH_BLUE);
+}
+
+// 0..255 per channel, as if this were a normal common-cathode LED -- the inversion
+// and the brightness cap are applied here so callers can think in plain RGB.
+static void ledSet(uint8_t r, uint8_t g, uint8_t b) {
+    ledcWrite(LED_CH_RED, 255 - ((uint32_t)r * LED_MAX_DUTY) / 255);
+    ledcWrite(LED_CH_GREEN, 255 - ((uint32_t)g * LED_MAX_DUTY) / 255);
+    ledcWrite(LED_CH_BLUE, 255 - ((uint32_t)b * LED_MAX_DUTY) / 255);
+}
+
 // Serial (to the Flipper) is written from the loop task and the async web/WS
 // task; serialize whole frames so bytes can't interleave. Engine state is also
 // touched from both tasks, so guard it too.
@@ -175,6 +209,14 @@ static void startPortal() {
     server.begin();
     portalRunning = true;
 
+    // Green = AP up and WPA2-protected, amber = AP up but OPEN. Worth distinguishing:
+    // an open AP is the one state where a passer-by can join, and the Flipper's own
+    // menu can't prove what the radio actually did with the password it sent.
+    if(apPass[0])
+        ledSet(0, 255, 0);
+    else
+        ledSet(255, 90, 0);
+
     String up = String("up ip=") + WiFi.softAPIP().toString();
     uartStatus(up.c_str());
 }
@@ -190,6 +232,7 @@ static void stopPortal() {
     ENGINE_LOCK();
     engine.reset();
     ENGINE_UNLOCK();
+    ledSet(0, 0, 40); // back to dim blue: idle, no AP
     uartStatus("stopped");
 }
 
@@ -402,10 +445,19 @@ static void pumpSerial() {
 void setup() {
     serialMutex = xSemaphoreCreateMutex();
     engineMutex = xSemaphoreCreateRecursiveMutex();
+    ledInit();
+    // Boot blink: the only sign of life this board gives on its own. Serial goes to
+    // UART0 (the Flipper's GPIO header), not USB-CDC, so a board sitting on a desk
+    // with just a USB cable enumerates nothing and shows nothing -- this blink is
+    // what tells you the firmware is actually running rather than the board being dead.
+    ledSet(255, 0, 0);
+    delay(150);
+    ledSet(0, 0, 0);
     Serial.setRxBufferSize(4096);
     Serial.begin(HA_UART_BAUD);
     delay(100);
     engine.reset();
+    ledSet(0, 0, 40); // dim blue: alive, waiting for the Flipper to start a session
     uartStatus("boot");
 }
 
