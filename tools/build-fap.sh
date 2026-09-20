@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the Hotspot Arcade .fap with the ESP firmware bundled inside it.
 #
-# The .fap ships the ESP32-S2 firmware images via fap_file_assets (see
+# The .fap ships the ESP32 firmware images via fap_file_assets (see
 # application.fam): the loader extracts them to /ext/apps_assets/hotspot_arcade/ on
 # launch, so a fresh install of just the .fap makes "Install Firmware" work with no
 # SD setup. Firmware images are build artifacts, so this wrapper regenerates them
@@ -14,7 +14,9 @@
 # If arduino-cli isn't available it falls back to the already-built images in
 # esp32/hotspot-arcade-fw/build/ (and errors if those are missing too).
 #
-# Usage: tools/build-fap.sh
+# Usage: 
+#   tools/build-fap.sh
+#   BOARD=wroom tools/build-fap.sh   # single-board variant (s2|wroom|c5)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,22 +26,55 @@ ASSETS_FW="$REPO/flipper/hotspot-arcade/assets/firmware"
 ASSETS_WEB="$REPO/flipper/hotspot-arcade/assets/web"
 ASSETS_PACKS="$REPO/flipper/hotspot-arcade/assets/packs"
 WEB_DIST="$REPO/web/dist"
-CORE_VER="2.0.17"
-# The ESP32-C5 is not in the 2.x cores at all, so it builds against a 3.x one.
-CORE_VER_C5="${CORE_VER_C5:-3.3.11}"
+# One core for every board. The S2 and WROOM were pinned to 2.0.17 for a long time; the
+# reason was never really "different WiFi/USB behaviour on 3.x" as the old comment here
+# claimed, it was that the S2 would not LINK -- the 3.x core gives it 8 KB less dram0 and
+# the sketch overflowed it. Moving the Zobrist table into flash and the trivia topics and
+# the UART receive buffer off static DRAM fixed that (dram0 free went from -6,560 to
+# +14,304 bytes, better than the 9,960 the 2.x core left), so the split is gone and every
+# board now gets DHCP option 114, which only exists in the 3.x line.
+CORE_VER="3.3.11"
 
 # Boards to build, "<fqbn>|<assets subdir>[|<core version>]". All build from the same
 # sketch; the fap bundles one image set per board and the on-device board picker chooses
 # which to flash. Adding a board is one more line here (+ its flash_*.txt and a picker row).
 #
-# The core version is optional and defaults to CORE_VER. The C5 needs it: that chip only
-# exists in the 3.x cores, while the S2/WROOM images stay on the pinned 2.0.17 so this
-# doesn't quietly re-cut them on a core with different WiFi/USB behaviour.
+# The core version is optional and defaults to CORE_VER; no board overrides it today.
+# CDCOnBoot=default is spelled out on both native-USB parts rather than left to the board
+# default, because it is what keeps Serial on UART0 -- the pins the Flipper talks to. If it
+# ever flipped, the beacon would vanish and the app would report "Firmware needed" while
+# staring at a perfectly good board.
 BOARDS=(
-    "esp32:esp32:esp32s2:PartitionScheme=huge_app,PSRAM=enabled|official_devboard"
+    "esp32:esp32:esp32s2:PartitionScheme=huge_app,PSRAM=enabled,CDCOnBoot=default|official_devboard"
     "esp32:esp32:esp32|wroom"
-    "esp32:esp32:esp32c5:PartitionScheme=huge_app,CDCOnBoot=default|c5|$CORE_VER_C5"
+    "esp32:esp32:esp32c5:PartitionScheme=huge_app,CDCOnBoot=default|c5"
 )
+
+BOARD="${BOARD:-all}"
+
+board_subdir() {
+    case "$1" in
+        s2)    echo "official_devboard" ;;
+        wroom) echo "wroom" ;;
+        c5)    echo "c5" ;;
+        *)
+            echo "ERROR: unknown BOARD '$1' (want: s2, wroom, c5, or all)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+if [ "$BOARD" != "all" ]; then
+    WANT_SUBDIR="$(board_subdir "$BOARD")"
+    # Filter BOARDS down to just the requested one so the arduino-cli loop below
+    # never touches the other two boards at all (no wasted compiles).
+    filtered=()
+    for entry in "${BOARDS[@]}"; do
+        IFS='|' read -r _ subdir _ <<< "$entry"
+        [ "$subdir" = "$WANT_SUBDIR" ] && filtered+=("$entry")
+    done
+    BOARDS=("${filtered[@]}")
+fi
 
 # Short tag used in the flashed filenames, per assets subdir. The Flipper shows the
 # filename while flashing, and "hotspot-arcade-fw.ino.bootloader.bin" is far wider
@@ -86,6 +121,12 @@ if [ -z "${ARDUINO_DIRECTORIES_DATA:-}" ] && [ -n "$ACLI" ]; then
     fi
 fi
 
+# Which esp32 core version arduino-cli currently has installed (empty if none).
+installed_core() {
+    [ -n "$ACLI" ] || return 0
+    "$ACLI" core list 2>/dev/null | awk '$1 == "esp32:esp32" { print $2; exit }'
+}
+
 # --- locate the core's boot_app0.bin (only needed when actually building) ---
 find_boot_app0() {
     local ver="${1:-$CORE_VER}"
@@ -100,6 +141,32 @@ find_boot_app0() {
 }
 # boot_app0 is resolved per board below, since they can build against different cores.
 
+# if a single-board build, set aside assets/firmware/ for the other boards; move the other boards' directories to a temp holding dir and move them back on exit
+STASH_DIR=""
+restore_stashed_boards() {
+    [ -n "$STASH_DIR" ] && [ -d "$STASH_DIR" ] || return 0
+    for dir in "$STASH_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        d="$(basename "$dir")"
+        rm -rf "$ASSETS_FW/$d"
+        mv "$dir" "$ASSETS_FW/$d"
+    done
+    rmdir "$STASH_DIR" 2>/dev/null || true
+}
+trap restore_stashed_boards EXIT
+
+if [ "$BOARD" != "all" ]; then
+    echo "==> Building single-board variant: $BOARD ($WANT_SUBDIR)"
+    if [ -d "$ASSETS_FW" ]; then
+        STASH_DIR="$(mktemp -d)"
+        for dir in "$ASSETS_FW"/*/; do
+            [ -d "$dir" ] || continue
+            d="$(basename "$dir")"
+            [ "$d" = "$WANT_SUBDIR" ] || mv "$dir" "$STASH_DIR/$d"
+        done
+    fi
+fi
+
 # --- build each board and populate assets/firmware/<subdir>/ ---
 # flash_official.txt / flash_wroom.txt are committed as the source of truth; only the
 # .bin images (and boot_app0) are (re)generated here.
@@ -109,6 +176,15 @@ for entry in "${BOARDS[@]}"; do
     out="$ASSETS_FW/$subdir"
     BOOT_APP0=""
     if [ -n "$ACLI" ]; then
+        # arduino-cli keeps ONE version of a platform installed at a time. Every board
+        # builds against the same core now, so this never actually swaps -- but it is
+        # what makes the script work on a machine that happens to have some other esp32
+        # core installed, which is otherwise a baffling boot_app0.bin-not-found failure.
+        # It stays for that, and so a future board needing its own core just works.
+        if [ "$(installed_core)" != "$board_core" ]; then
+            echo "==> switching to the esp32 $board_core core (for $subdir)"
+            "$ACLI" core install "esp32:esp32@$board_core"
+        fi
         BOOT_APP0="$(find_boot_app0 "$board_core" || true)"
         if [ -z "$BOOT_APP0" ]; then
             echo "ERROR: could not find boot_app0.bin for the esp32 $board_core core." >&2
@@ -210,4 +286,5 @@ ls -la "$ASSETS_PACKS"/*
 echo "==> Running ufbt"
 cd "$REPO/flipper/hotspot-arcade"
 ufbt "$@"
-echo "==> Done: flipper/hotspot-arcade/dist/hotspot_arcade.fap"
+mv dist/hotspot_arcade.fap "dist/hotspot_arcade-$BOARD.fap"
+echo "==> Done: flipper/hotspot-arcade/dist/hotspot_arcade-$BOARD.fap"

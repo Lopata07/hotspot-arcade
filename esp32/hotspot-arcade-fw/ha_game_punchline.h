@@ -47,8 +47,8 @@ struct PunchPair {
 
 struct PunchState {
     Party pt;
-    WordPack packs[TRIVIA_MAX_TOPICS]; // each words[] entry is one prompt string
-    uint8_t packCount;
+    // Prompt packs live in Engine::_punchPacks / _punchPackCount, outside the
+    // game-state union: WordPack holds Strings, and the union is POD-only.
     int8_t vote[HA_MAX_PLAYERS + 1]; // pack index, -1 = not voted
     uint8_t pack; // chosen pack (locked when the game starts)
     uint16_t promptSeq; // advances the prompts drawn across rounds
@@ -108,7 +108,7 @@ void punchReady(uint8_t pid, bool val) {
 
 void punchVote(uint8_t pid, int pack) {
     if(_active != HA_GAME_PUNCHLINE || _punch.pt.phase != 0) return;
-    if(pack < 0 || pack >= _punch.packCount) return;
+    if(pack < 0 || pack >= _punchPackCount) return;
     _punch.vote[pid] = (int8_t)pack;
     pushAll();
 }
@@ -116,7 +116,7 @@ void punchVote(uint8_t pid, int pack) {
 // Same as spectrumCheckStart(), plus a floor of 3 connected players: ring-pairing
 // needs at least 3 distinct people to produce a sensible pairing.
 void punchCheckStart() {
-    if(_punch.packCount == 0) return;
+    if(_punchPackCount == 0) return;
     Party& pt = _punch.pt;
     if(pt.phase == 0 && partyAllReady(pt) && connectedCount() >= 3) {
         pt.phase = 1;
@@ -130,28 +130,28 @@ void punchCheckStart() {
 // Mirrors spectrumWinningPack(): most pre-game votes wins, ties broken at random,
 // an untallied vote (nobody voted) picks uniformly at random.
 int punchWinningPack() {
-    if(_punch.packCount == 0) return 0;
+    if(_punchPackCount == 0) return 0;
     int votes[TRIVIA_MAX_TOPICS] = {0};
     int total = 0;
     for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
-        if(_p[i].used && _punch.vote[i] >= 0 && _punch.vote[i] < _punch.packCount) {
+        if(_p[i].used && _punch.vote[i] >= 0 && _punch.vote[i] < _punchPackCount) {
             votes[_punch.vote[i]]++;
             total++;
         }
-    if(total == 0) return (int)random(_punch.packCount);
+    if(total == 0) return (int)random(_punchPackCount);
     int best = 0;
-    for(int i = 1; i < _punch.packCount; i++)
+    for(int i = 1; i < _punchPackCount; i++)
         if(votes[i] > votes[best]) best = i;
     int tie[TRIVIA_MAX_TOPICS], tn = 0;
-    for(int i = 0; i < _punch.packCount; i++)
+    for(int i = 0; i < _punchPackCount; i++)
         if(votes[i] == votes[best]) tie[tn++] = i;
     return tie[(int)random(tn)];
 }
 
 // Map a punchline pack file's {prompt} key into the current pack.
 bool punchLoadItem(const char* json) {
-    if(_punch.packCount == 0) return false;
-    WordPack& p = _punch.packs[_punch.packCount - 1];
+    if(_punchPackCount == 0) return false;
+    WordPack& p = _punchPacks[_punchPackCount - 1];
     if(p.count >= PACK_MAX_ITEMS) return false;
     char buf[PUNCH_PROMPT_BYTES];
     if(!ha_json_str(json, "prompt", buf, sizeof(buf)) || !buf[0]) return false;
@@ -165,9 +165,10 @@ bool punchLoadItem(const char* json) {
 // stored, matching how spectrumPickPsychic() enumerates players.
 void punchBuildPairs(uint32_t now) {
     Party& pt = _punch.pt;
-    WordPack& pk = _punch.packs[_punch.pack];
+    WordPack& pk = _punchPacks[_punch.pack];
     if(pk.count == 0) {
         pt.phase = 4;
+        if(pt.round > 0) awardContest(); // a bail-out still pays if a round was played
         pushAll();
         return;
     }
@@ -178,6 +179,7 @@ void punchBuildPairs(uint32_t now) {
         if(_p[i].used) order[n++] = i;
     if(n < 3) { // roster dropped below the floor mid-game
         pt.phase = 4;
+        if(pt.round > 0) awardContest(); // a bail-out still pays if a round was played
         pushAll();
         return;
     }
@@ -329,6 +331,7 @@ void punchNextRound(uint32_t now) {
     Party& pt = _punch.pt;
     if(pt.round >= PUNCH_ROUNDS) {
         pt.phase = 4;
+        awardContest(); // played to the end: the standings pay out across games
         pushAll();
         return;
     }
@@ -339,9 +342,10 @@ void punchNextRound(uint32_t now) {
 
 void punchBuildLash(uint32_t now) {
     Party& pt = _punch.pt;
-    WordPack& pk = _punch.packs[_punch.pack];
+    WordPack& pk = _punchPacks[_punch.pack];
     if(pk.count == 0) {
         pt.phase = 4;
+        if(pt.round > 0) awardContest(); // a bail-out still pays if a round was played
         pushAll();
         return;
     }
@@ -523,11 +527,11 @@ String punchJson(uint8_t pid) {
                    ",\"players\":" + partyPlayersJson(pt) + ",\"packs\":[";
         int votes[TRIVIA_MAX_TOPICS] = {0};
         for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
-            if(_p[i].used && _punch.vote[i] >= 0 && _punch.vote[i] < _punch.packCount)
+            if(_p[i].used && _punch.vote[i] >= 0 && _punch.vote[i] < _punchPackCount)
                 votes[_punch.vote[i]]++;
-        for(int i = 0; i < _punch.packCount; i++) {
+        for(int i = 0; i < _punchPackCount; i++) {
             if(i) s += ",";
-            s += "{\"name\":\"" + ha_json_escape(_punch.packs[i].name.c_str()) +
+            s += "{\"name\":\"" + ha_json_escape(_punchPacks[i].name.c_str()) +
                  "\",\"votes\":" + votes[i] + "}";
         }
         s += "],\"myvote\":" + String((int)_punch.vote[pid]) + "}";

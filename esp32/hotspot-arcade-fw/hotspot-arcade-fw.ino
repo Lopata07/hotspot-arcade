@@ -1,8 +1,9 @@
 // Hotspot Arcade firmware for the ESP32-S2 WiFi dev board.
 //
 // Hosts an open WiFi AP + captive portal that serves a multiplayer game web app
-// (streamed from the Flipper into RAM), and acts as the real-time referee over a
-// WebSocket while the Flipper drives the session over UART v2. See docs/PROTOCOL.md.
+// (streamed from the Flipper into a LittleFS flash partition, then served from flash),
+// and acts as the real-time referee over a WebSocket while the Flipper drives the
+// session over UART v2. See docs/PROTOCOL.md.
 //
 // For education/fun on your own hardware. It runs an OPEN access point and a
 // catch-all captive page; only operate it where that is allowed.
@@ -12,16 +13,36 @@
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
 #include <esp_wifi.h>
+#include <esp_netif.h>
+#include <esp_heap_caps.h>
+// dhcpserver.h sits at a different path in IDF 4.x (the pinned 2.0.17 core, S2/WROOM) and
+// IDF 5.x (the 3.x core the C5 needs), and all we want from it is one flag. Probe for it
+// rather than pick a path that only builds on one of the two boards.
+#if __has_include(<dhcpserver/dhcpserver.h>)
+#include <dhcpserver/dhcpserver.h>
+#elif __has_include(<lwip/apps/dhcpserver/dhcpserver.h>)
+#include <lwip/apps/dhcpserver/dhcpserver.h>
+#else
+#define OFFER_DNS 0x02 // DHCP server "also send option 6"; stable across both IDF lines
+#endif
+#include <lwip/etharp.h>
 
 #include "ha_proto.h"
 #include "ha_json.h"
 #include "ha_assets.h"
 #include "ha_games.h"
 
+// Where the RFC 8908 Captive Portal API lives. Advertised in DHCP option 114 and served
+// by ArcadeHandler; deliberately not "/", which is the app itself.
+#define HA_CAPTIVE_API_PATH "/captive-api"
+
 #define WS_MSG_MAX 512
 #define AP_MAX_CONN 8
-#define CAPTIVE_AUTH_MAX 15 // matches the "max" SET_AP ceiling below
 
+// Did DHCP option 114 actually go out? Reported in the beacon so the host can tell "we
+// never advertised the portal API" apart from "we did and the phone ignored it" -- two very
+// different problems that look identical from the sofa.
+static bool captiveApiOk = false;
 static DNSServer dnsServer;
 static AsyncWebServer server(80);
 static AsyncWebSocket ws("/ws");
@@ -30,42 +51,10 @@ static char apName[33] = "Hotspot Arcade";
 static char apPass[64] = ""; // "" = open network
 static bool portalRunning = false;
 static uint8_t apMaxConn = AP_MAX_CONN;
+static bool fsReady = false; // LittleFS mounted (bundle store)
 
 static AssetStore assets;
 static Engine engine;
-
-// ---------------- captive-probe success handoff ----------------
-// iOS opens its captive mini-browser (CNA) and keeps the network flagged "sign-in
-// required" until something answers its background probe with Apple's exact success
-// page; until then, dismissing or backgrounding the CNA window drops the WiFi
-// association outright. We can't say "internet's fine" before the player has actually
-// joined (or the CNA window would never open with the app in the first place), so a
-// client only starts getting the success page once its WebSocket has connected once —
-// from then on iOS sees a normal network and stops tearing down the connection.
-static uint32_t captiveAuthIp[CAPTIVE_AUTH_MAX] = {0};
-
-static void captiveAuthReset() {
-    memset(captiveAuthIp, 0, sizeof(captiveAuthIp));
-}
-static void captiveAuthMark(IPAddress ip) {
-    uint32_t raw = (uint32_t)ip;
-    for(uint8_t i = 0; i < CAPTIVE_AUTH_MAX; i++) {
-        if(captiveAuthIp[i] == raw) return; // already marked
-    }
-    for(uint8_t i = 0; i < CAPTIVE_AUTH_MAX; i++) {
-        if(captiveAuthIp[i] == 0) {
-            captiveAuthIp[i] = raw;
-            return;
-        }
-    }
-}
-static bool captiveAuthed(IPAddress ip) {
-    uint32_t raw = (uint32_t)ip;
-    for(uint8_t i = 0; i < CAPTIVE_AUTH_MAX; i++) {
-        if(captiveAuthIp[i] == raw) return true;
-    }
-    return false;
-}
 
 // ---------------- status LED ----------------
 // The official devboard carries an RGB LED wired to these three pins. They are not
@@ -79,26 +68,25 @@ static bool captiveAuthed(IPAddress ip) {
 #define LED_PIN_RED   6
 #define LED_PIN_GREEN 5
 #define LED_PIN_BLUE  4
-#define LED_CH_RED    5 // LEDC channels 5-7: the engine uses none, so no conflict
-#define LED_CH_GREEN  6
-#define LED_CH_BLUE   7
+#define LED_FREQ_HZ   5000
+#define LED_RES_BITS  8
 #define LED_MAX_DUTY  20 // of 255, matching the factory firmware's own cap
 
+// Core 3.x LEDC: channels are assigned by the driver and addressed by PIN, so there
+// is no ledcSetup()/ledcAttachPin() pair and no channel number to pick any more.
+// (This code was written against the 2.x API, which core 3.x dropped outright.)
 static void ledInit() {
-    ledcSetup(LED_CH_RED, 5000, 8);
-    ledcSetup(LED_CH_GREEN, 5000, 8);
-    ledcSetup(LED_CH_BLUE, 5000, 8);
-    ledcAttachPin(LED_PIN_RED, LED_CH_RED);
-    ledcAttachPin(LED_PIN_GREEN, LED_CH_GREEN);
-    ledcAttachPin(LED_PIN_BLUE, LED_CH_BLUE);
+    ledcAttach(LED_PIN_RED, LED_FREQ_HZ, LED_RES_BITS);
+    ledcAttach(LED_PIN_GREEN, LED_FREQ_HZ, LED_RES_BITS);
+    ledcAttach(LED_PIN_BLUE, LED_FREQ_HZ, LED_RES_BITS);
 }
 
 // 0..255 per channel, as if this were a normal common-cathode LED -- the inversion
 // and the brightness cap are applied here so callers can think in plain RGB.
 static void ledSet(uint8_t r, uint8_t g, uint8_t b) {
-    ledcWrite(LED_CH_RED, 255 - ((uint32_t)r * LED_MAX_DUTY) / 255);
-    ledcWrite(LED_CH_GREEN, 255 - ((uint32_t)g * LED_MAX_DUTY) / 255);
-    ledcWrite(LED_CH_BLUE, 255 - ((uint32_t)b * LED_MAX_DUTY) / 255);
+    ledcWrite(LED_PIN_RED, 255 - ((uint32_t)r * LED_MAX_DUTY) / 255);
+    ledcWrite(LED_PIN_GREEN, 255 - ((uint32_t)g * LED_MAX_DUTY) / 255);
+    ledcWrite(LED_PIN_BLUE, 255 - ((uint32_t)b * LED_MAX_DUTY) / 255);
 }
 
 // Serial (to the Flipper) is written from the loop task and the async web/WS
@@ -108,6 +96,140 @@ static SemaphoreHandle_t serialMutex = nullptr;
 static SemaphoreHandle_t engineMutex = nullptr;
 #define ENGINE_LOCK() xSemaphoreTakeRecursive(engineMutex, portMAX_DELAY)
 #define ENGINE_UNLOCK() xSemaphoreGiveRecursive(engineMutex)
+
+// ---------------- device identity (one phone = one player) ----------------
+//
+// The engine keys a player on the phone rather than on the socket (see Player in
+// ha_games.h), so that a second browser context -- iOS opens the portal in a captive
+// mini-browser alongside Safari -- joins the player that phone already has instead of
+// becoming a new one. The WebSocket layer only knows a peer IP, and that IP is
+// something our own DHCP server made up, so resolve it to the station's MAC (the
+// actual device identity) and hand the engine an opaque key built from that.
+//
+// Phones default to a randomized "private" MAC, but it is stable per SSID: it survives
+// reconnects and only changes if the AP is renamed. Exactly the lifetime we need.
+//
+// The IP -> MAC mapping comes from the AP's own DHCP server: ip_event_ap_staipassigned_t
+// carries the assigned address *and* the client MAC, so one event handler can keep a
+// small table (the AP caps stations well below HA_STA_MAX). A station that got its lease
+// before the handler was installed is missing from it; for those, read the MAC out of
+// lwIP's ARP cache instead, and if even that misses, key on the IP.
+
+#define HA_STA_MAX 10 // >= ESP_WIFI_MAX_CONN_NUM: the AP cannot hold more leases
+#define HA_KEY_MAC 0x01 // key tag: low 48 bits are a station MAC
+#define HA_KEY_IP 0x02 // key tag: low 32 bits are an IPv4 address
+
+struct StaLease {
+    uint32_t ip; // 0 = free slot
+    uint8_t mac[6];
+};
+static StaLease staLeases[HA_STA_MAX];
+// Written from the WiFi event task, read from the async WS task; the critical section
+// is a handful of instructions over a 10-entry array.
+static portMUX_TYPE leaseMux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint64_t macDeviceKey(const uint8_t* mac) {
+    uint64_t v = 0;
+    for(int i = 0; i < 6; i++) v = (v << 8) | mac[i];
+    return ((uint64_t)HA_KEY_MAC << 56) | v;
+}
+
+static void leaseNote(uint32_t ip, const uint8_t* mac) {
+    portENTER_CRITICAL(&leaseMux);
+    int slot = -1, freeSlot = -1;
+    for(int i = 0; i < HA_STA_MAX; i++) {
+        if(!staLeases[i].ip) {
+            if(freeSlot < 0) freeSlot = i;
+        } else if(memcmp(staLeases[i].mac, mac, 6) == 0) {
+            slot = i; // same phone, (re)leased
+            break;
+        } else if(staLeases[i].ip == ip) {
+            slot = i; // this address now belongs to a different station
+        }
+    }
+    if(slot < 0) slot = freeSlot >= 0 ? freeSlot : 0;
+    staLeases[slot].ip = ip;
+    memcpy(staLeases[slot].mac, mac, 6);
+    portEXIT_CRITICAL(&leaseMux);
+}
+
+static void leaseForget(const uint8_t* mac) {
+    portENTER_CRITICAL(&leaseMux);
+    for(int i = 0; i < HA_STA_MAX; i++)
+        if(staLeases[i].ip && memcmp(staLeases[i].mac, mac, 6) == 0) staLeases[i].ip = 0;
+    portEXIT_CRITICAL(&leaseMux);
+}
+
+static void leasesClear() {
+    portENTER_CRITICAL(&leaseMux);
+    memset(staLeases, 0, sizeof(staLeases));
+    portEXIT_CRITICAL(&leaseMux);
+}
+
+static bool leaseMac(uint32_t ip, uint8_t* out) {
+    bool found = false;
+    portENTER_CRITICAL(&leaseMux);
+    for(int i = 0; i < HA_STA_MAX && !found; i++)
+        if(staLeases[i].ip == ip) {
+            memcpy(out, staLeases[i].mac, 6);
+            found = true;
+        }
+    portEXIT_CRITICAL(&leaseMux);
+    return found;
+}
+
+// The address a MAC currently holds, for the log line only (0 if unknown).
+static uint32_t leaseIp(const uint8_t* mac) {
+    uint32_t ip = 0;
+    portENTER_CRITICAL(&leaseMux);
+    for(int i = 0; i < HA_STA_MAX && !ip; i++)
+        if(staLeases[i].ip && memcmp(staLeases[i].mac, mac, 6) == 0) ip = staLeases[i].ip;
+    portEXIT_CRITICAL(&leaseMux);
+    return ip;
+}
+
+// Fallback for a station whose lease we never saw. Read without the lwIP core lock:
+// the ARP table is a fixed static array, so the worst case is reading a half-updated
+// entry (a wrong MAC, i.e. one extra player) rather than a bad pointer.
+static bool arpMac(uint32_t ip, uint8_t* out) {
+    for(size_t i = 0; i < ARP_TABLE_SIZE; i++) {
+        ip4_addr_t* eip = nullptr;
+        struct netif* nif = nullptr;
+        struct eth_addr* eth = nullptr;
+        if(etharp_get_entry(i, &eip, &nif, &eth) && eip && eth && eip->addr == ip) {
+            memcpy(out, eth->addr, 6);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Which phone a socket is on, as the opaque key the engine stores. 0 = unknown, which
+// makes the engine fall back to one player per connection rather than merging clients.
+static uint64_t peerDeviceKey(AsyncWebSocketClient* client) {
+    uint32_t ip = (uint32_t)client->remoteIP();
+    if(!ip || ip == (uint32_t)apIP) return 0; // not a joined station
+    uint8_t mac[6];
+    if(leaseMac(ip, mac) || arpMac(ip, mac)) return macDeviceKey(mac);
+    return ((uint64_t)HA_KEY_IP << 56) | ip; // last resort: the address itself
+}
+
+// Render a key for the serial log: "ip=.. mac=.." when we know both.
+static String deviceKeyText(uint64_t key) {
+    char b[64];
+    if((uint8_t)(key >> 56) == HA_KEY_MAC) {
+        uint8_t mac[6];
+        for(int i = 0; i < 6; i++) mac[i] = (uint8_t)(key >> (40 - 8 * i));
+        uint32_t ip = leaseIp(mac);
+        String where = ip ? String("ip=") + IPAddress(ip).toString() + " " : String("");
+        snprintf(b, sizeof(b), "mac=%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2],
+                 mac[3], mac[4], mac[5]);
+        return where + b;
+    }
+    if((uint8_t)(key >> 56) == HA_KEY_IP)
+        return String("ip=") + IPAddress((uint32_t)(key & 0xFFFFFFFFu)).toString() + " mac=?";
+    return String("device=unknown");
+}
 
 // ---------------- UART TX ----------------
 
@@ -161,28 +283,61 @@ void haUartScore(uint8_t pid, int delta, const char* reason) {
     memcpy(buf + 3, reason, n);
     uartSend(HA_MSG_SCORE, buf, 3 + n);
 }
+void haUartTotal(uint8_t pid, int32_t total) {
+    uint8_t buf[1 + 4];
+    buf[0] = pid;
+    buf[1] = (uint8_t)(total & 0xFF);
+    buf[2] = (uint8_t)((total >> 8) & 0xFF);
+    buf[3] = (uint8_t)((total >> 16) & 0xFF);
+    buf[4] = (uint8_t)((total >> 24) & 0xFF);
+    uartSend(HA_MSG_TOTAL, buf, 5);
+}
 void haUartEvent(const String& json) {
     uartSend(HA_MSG_EVENT, (const uint8_t*)json.c_str(), json.length());
 }
 void haUartRoundResult(const String& json) {
     uartSend(HA_MSG_ROUND_RESULT, (const uint8_t*)json.c_str(), json.length());
 }
+// Finished artwork (Frankendraw). One frame per call -- a sheet header, a single line
+// segment, or the end marker -- so a whole drawing streams to the Flipper a segment at
+// a time and neither side ever buffers one. Payload is the op byte then the JSON.
+void haUartArt(uint8_t op, const String& json) {
+    uint8_t buf[192];
+    buf[0] = op;
+    size_t n = json.length();
+    if(n > sizeof(buf) - 1) n = sizeof(buf) - 1;
+    memcpy(buf + 1, json.c_str(), n);
+    uartSend(HA_MSG_ART, buf, 1 + n);
+}
+
+// Debug trace of the engine's identity decisions. Serial is the Flipper link, so a
+// log line shares the wire with the framed protocol: safe because the receiver only
+// starts a frame on the SYNC byte (0xA5) and resyncs on a bad CRC, and because
+// haLog() emits printable ASCII only -- a UTF-8 nickname could otherwise carry a
+// literal 0xA5 and be mistaken for the start of a frame. Written under the same
+// mutex as a frame, so it can never land inside one.
+static void haLog(const String& line) {
+    if(serialMutex) xSemaphoreTake(serialMutex, portMAX_DELAY);
+    Serial.print("\n[ha] ");
+    for(const char* p = line.c_str(); *p; p++)
+        Serial.write((*p >= 0x20 && (uint8_t)*p < 0x7F) ? *p : '?');
+    Serial.print("\n");
+    if(serialMutex) xSemaphoreGive(serialMutex);
+}
+void haLogJoin(uint8_t pid, uint64_t deviceKey, const char* nick, bool consolidated) {
+    String where = deviceKeyText(deviceKey);
+    if(consolidated)
+        haLog(String("SAME DEVICE ") + where + " -> pid=" + pid + " nick=\"" + nick +
+              "\" (consolidated)");
+    else
+        haLog(String("JOIN pid=") + pid + " " + where + " nick=\"" + nick + "\"");
+}
 
 // ---------------- HTTP (captive) ----------------
 
-// Apple's captive-portal probe checks this exact page verbatim; returning it tells
-// iOS the network has real internet, which closes the CNA window on its own and
-// stops it from tearing down the WiFi association on background/dismiss. Byte-exact,
-// no extra whitespace -- iOS matches the body literally.
-static const char CAPTIVE_SUCCESS_HTML[] =
-    "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
-
 // Serve the streamed web bundle for every host/path so the captive portal always
 // resolves. GET "/" (and every OS captive-probe URL) gets the app; other stored
-// asset paths are served by exact match. Exception: once a client's WebSocket has
-// connected at least once, its *next* hit on Apple's probe path gets the success page
-// instead of the app, so the CNA window stops holding the WiFi hostage after they've
-// actually joined.
+// asset paths are served by exact match.
 class ArcadeHandler : public AsyncWebHandler {
 public:
     bool canHandle(AsyncWebServerRequest* request) const override {
@@ -191,21 +346,58 @@ public:
     }
     void handleRequest(AsyncWebServerRequest* request) override {
         String url = request->url();
-        if(url == "/hotspot-detect.html" && request->host() == "captive.apple.com" &&
-           captiveAuthed(request->client()->remoteIP())) {
-            request->send(200, "text/html", CAPTIVE_SUCCESS_HTML);
+        // RFC 8908 Captive Portal API. This is what DHCP option 114 points at, and it is
+        // NOT the portal page: it is a tiny JSON document describing the network's captive
+        // state, served as application/captive+json. Answering it with the app's HTML (which
+        // is what pointing option 114 at "/" did) makes the phone discard the whole
+        // mechanism and fall back to probe sniffing -- the popup still appears, but the
+        // persistent "Log In" entry in the OS network settings never does, because as far as
+        // the OS is concerned this network has no API.
+        if(url == HA_CAPTIVE_API_PATH) {
+            AsyncWebServerResponse* r = request->beginResponse(
+                200, "application/captive+json",
+                "{\"captive\":true,\"user-portal-url\":\"http://192.168.4.1/\"}");
+            r->addHeader("Cache-Control", "no-store");
+            request->send(r);
             return;
         }
         const Asset* a = assets.find(url.c_str());
-        if(!a) a = assets.root(); // captive-detection URLs -> the app
-        if(!a || !a->buf || a->len == 0) {
-            request->send(200, "text/html", "<h1>Hotspot Arcade</h1><p>No bundle loaded.</p>");
+        if(!a) a = assets.root(); // captive-detection URLs and "/" -> the app
+        // Serve the ~47 KB app to real browsers -- including the iOS captive WINDOW, which is
+        // a WebKit view with a "Mozilla" User-Agent, so the app renders there too. The OS
+        // captive-detection *probes* (User-Agent "CaptiveNetworkSupport...") fire several at
+        // once; serving the bundle from flash to each copies into per-connection TCP buffers
+        // and storms the heap, so those get a tiny landing instead.
+        bool browser = request->header("User-Agent").indexOf("Mozilla") >= 0;
+        // HTTP caching: the bundle CRC is a strong ETag. A client that already holds this exact
+        // bundle revalidates with If-None-Match and gets a tiny 304 -- no 47 KB body -- so a
+        // reload or an iOS captive re-probe costs nothing instead of re-sending the whole
+        // bundle. The ETag changes when the host updates the bundle, so updates are never stale.
+        char etag[12] = "";
+        if(browser && fsReady && a && a->len) {
+            snprintf(etag, sizeof(etag), "\"%08lx\"", (unsigned long)assets.bundleCrc());
+            if(request->header("If-None-Match") == etag) {
+                AsyncWebServerResponse* nm = request->beginResponse(304);
+                nm->addHeader("ETag", etag);
+                request->send(nm);
+                return;
+            }
+        }
+        File f;
+        if(browser && fsReady && a && a->len) f = LittleFS.open(a->fsname, "r");
+        if(!f) {
+            request->send(200, "text/html",
+                          "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+                          "<body style='margin:0;background:#0b0b12;color:#eee;text-align:center;"
+                          "font:16px system-ui,sans-serif;padding:2.5em 1em'><h2>Hotspot Arcade</h2>"
+                          "<p>Open <b>192.168.4.1</b> in your browser to play.</p></body>");
             return;
         }
-        AsyncWebServerResponse* res =
-            request->beginResponse(200, a->mime, (const uint8_t*)a->buf, a->len);
-        if(a->gzip) res->addHeader("Content-Encoding", "gzip");
-        res->addHeader("Cache-Control", "no-store");
+        // Streamed from flash (no RAM copy). The stored name ends ".gz" while a->path does
+        // not, so AsyncFileResponse sets Content-Encoding: gzip for us; mime is explicit.
+        AsyncWebServerResponse* res = request->beginResponse(f, String(a->path), (const char*)a->mime);
+        res->addHeader("ETag", etag);
+        res->addHeader("Cache-Control", "no-cache");
         request->send(res);
     }
 };
@@ -221,7 +413,14 @@ static void onWsEvent(
     size_t len) {
     (void)srv;
     if(type == WS_EVT_CONNECT) {
-        captiveAuthMark(client->remoteIP());
+        // Every push is a whole snapshot -- pushAll() sends the lobby plus the full
+        // game state, never a delta -- so a frame that goes missing is repaired by
+        // the next one a moment later. The library's default trade is the opposite:
+        // when a client's send queue fills up it closes the connection. On a phone
+        // that dozed off for a second that is the difference between a stutter and
+        // losing your seat mid-round, and it looks to the room like a random drop.
+        // Discard the frame instead; the next push carries the same truth.
+        client->setCloseClientOnQueueFull(false);
     } else if(type == WS_EVT_DISCONNECT) {
         ENGINE_LOCK();
         engine.onWsDisconnect(client->id());
@@ -234,7 +433,7 @@ static void onWsEvent(
             memcpy(buf, data, len);
             buf[len] = '\0';
             ENGINE_LOCK();
-            engine.onInput(client->id(), buf);
+            engine.onInput(client->id(), peerDeviceKey(client), buf);
             ENGINE_UNLOCK();
         }
     }
@@ -242,8 +441,82 @@ static void onWsEvent(
 
 // ---------------- AP lifecycle ----------------
 
+// The AP's DHCP server is where a station's IP and MAC are seen together. Registered
+// once in setup(), before any AP comes up, so no lease is missed (see peerDeviceKey).
+static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+    if(event == ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED)
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+        // esp-idf 5+ (Arduino core 3.x, e.g. the C5): the assign event carries the MAC.
+        leaseNote(info.wifi_ap_staipassigned.ip.addr, info.wifi_ap_staipassigned.mac);
+#else
+        // esp-idf 4.x (Arduino core 2.0.x, the S2/WROOM): the staipassigned event has no
+        // MAC field, so we can't record the lease here. peerDeviceKey() then resolves the
+        // station from the lwIP ARP cache at hello() time, which by then holds its entry.
+        (void)info;
+#endif
+    else if(event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED)
+        leaseForget(info.wifi_ap_stadisconnected.mac);
+}
+
+// Tell joining phones two things at once: who resolves names here, and where the portal
+// is. Both are DHCP options, both need the server stopped to set, so they share one restart
+// rather than bouncing it twice while a station may already be probing.
+//
+// ---- Option 6, the DNS server ----
+//
+// Without this the AP leases an address and a gateway but NO resolver: esp_netif's DHCP
+// server does not offer DNS unless it is asked to, and Arduino's softAPConfig() never asks
+// (set_esp_interface_ip only touches the address info). A phone then cannot resolve the
+// hostname its OS probes to decide whether a network is captive -- captive.apple.com on
+// iOS, connectivitycheck.gstatic.com on Android -- so the probe fails to resolve instead of
+// being intercepted.
+//
+// That distinction is the whole bug. A probe that is answered with the wrong page means
+// "captive" and opens the portal; a probe that cannot even resolve means "no internet", and
+// iOS says exactly that and offers nothing. Typing 192.168.4.1 by hand still worked the
+// whole time, because an IP needs no lookup, which is what kept this hidden. The wildcard
+// DNSServer below was always ready to answer; nothing was telling the phones to ask it.
+//
+// ---- Option 114, the Captive Portal API (RFC 8910) ----
+//
+// Option 6 gets the OS probe working again, which is enough to make the portal pop up by
+// itself. Option 114 is the better mechanism and the one modern in-flight WiFi uses: it
+// hands the phone the portal URL outright, so the OS marks the network captive without
+// having to be tricked by a probe response, and iOS keeps a persistent entry for it in
+// WiFi settings instead of a popup you can dismiss and never find again.
+//
+// This is why every board is on the 3.x core now: ESP_NETIF_CAPTIVEPORTAL_URI does not
+// exist in the 2.0.17 line at all, and the Arduino helper for it is gated at IDF 5.4.2.
+static void apAnnouncePortal() {
+    esp_netif_t* ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if(!ap) return;
+    esp_netif_dns_info_t dns = {};
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    dns.ip.u_addr.ip4.addr = (uint32_t)apIP;
+    // Options can only be set while the server is stopped, so do all of them in one window.
+    esp_netif_dhcps_stop(ap);
+    esp_netif_set_dns_info(ap, ESP_NETIF_DNS_MAIN, &dns);
+    uint8_t offer = OFFER_DNS;
+    esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER, &offer, sizeof(offer));
+    // Option 114 goes in the SAME stopped window rather than through Arduino's
+    // WiFi.AP.enableDhcpCaptivePortal(), for two reasons. That helper hardcodes the URI to
+    // "http://<ip>", the app's own page, which is the wrong thing to advertise -- the option
+    // must point at the RFC 8908 API endpoint, not at the portal. And it bounces the DHCP
+    // server a second time, right when a station may already be probing.
+    //
+    // esp_netif keeps the POINTER we hand it rather than copying the string, so this buffer
+    // is static and outlives the call.
+    static char captiveUri[40];
+    snprintf(captiveUri, sizeof(captiveUri), "http://%s%s",
+             apIP.toString().c_str(), HA_CAPTIVE_API_PATH);
+    esp_err_t cperr = esp_netif_dhcps_option(
+        ap, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI, captiveUri, strlen(captiveUri));
+    esp_netif_dhcps_start(ap);
+    captiveApiOk = (cperr == ESP_OK); // reported in the PING beacon, see below
+}
+
 static void startPortal() {
-    captiveAuthReset(); // DHCP reassigns the same IPs to different phones each session
+    leasesClear(); // a fresh session leases fresh addresses
     WiFi.mode(WIFI_AP);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
     // A non-empty password switches the driver to WPA2-PSK; empty keeps the
@@ -252,6 +525,7 @@ static void startPortal() {
     // chars, so that floor lives entirely in the UI (Task 4), not here.
     WiFi.softAP(apName, apPass[0] ? apPass : nullptr, 1, 0, apMaxConn);
     delay(100);
+    apAnnouncePortal(); // before any station leases, or the first joiner gets neither
     uartStatus("ap_ok");
 
     dnsServer.start(53, "*", apIP);
@@ -281,6 +555,7 @@ static void stopPortal() {
         WiFi.softAPdisconnect(true);
         portalRunning = false;
     }
+    leasesClear();
     ENGINE_LOCK();
     engine.reset();
     ENGINE_UNLOCK();
@@ -295,7 +570,14 @@ static RxState rxState = RX_SYNC;
 static uint8_t rxType = 0;
 static uint16_t rxLen = 0, rxIdx = 0;
 static uint8_t rxCrc = 0;
-static uint8_t rxBuf[HA_MAX_PAYLOAD + 1];
+// The framed protocol's receive buffer, allocated once at boot and never freed.
+//
+// It is 4 KB and it used to be static, which the linker has to reserve inside the S2's
+// dram0 segment whether a session is running or not. Off the heap it costs the same RAM
+// on a board with no PSRAM, but it stops the LINK depending on it, and on the S2 it lands
+// in PSRAM and is genuinely gone from internal memory. Sized once because every frame is
+// bounded by HA_MAX_PAYLOAD, so there is nothing to grow or shrink at runtime.
+static uint8_t* rxBuf = nullptr;
 
 // FILE_BEGIN payload: flags(1) pathlen(1) path mimelen(1) mime total(4 LE)
 static void handleFileBegin(const uint8_t* p, size_t len) {
@@ -357,6 +639,7 @@ static void dispatchFrame() {
                 apPass[0] = '\0';
             }
         }
+        assets.finishStream(); // file phase done: persist the bundle + its CRC if it changed
         uartStatus("ap_set");
         break;
     case HA_MSG_START:
@@ -452,6 +735,7 @@ static void rxByte(uint8_t c) {
         rxState = rxLen ? RX_PAYLOAD : RX_CRC;
         break;
     case RX_PAYLOAD:
+        if(!rxBuf) { rxState = RX_SYNC; break; } // no buffer: drop the frame, stay in sync
         rxBuf[rxIdx++] = c;
         rxCrc = ha_crc8_upd(rxCrc, c);
         if(rxIdx >= rxLen) rxState = RX_CRC;
@@ -494,7 +778,24 @@ static void pumpSerial() {
 
 // ---------------- Arduino entry ----------------
 
+// How big an allocation has to be before it is allowed to live in PSRAM.
+//
+// The core boots this at CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, which the 3.x SDK ships as
+// 4096, so everything smaller than 4 KB is forced into internal RAM no matter how much
+// PSRAM is free. An async web server's per-connection allocations are nearly all smaller
+// than that, which is exactly why the board could sit on 1.9 MB of unused PSRAM while its
+// internal heap drained to 11 KB and a second phone could not finish associating.
+//
+// Dropping it to 1 KB lets PSRAM take the bulk of that traffic. Allocations that genuinely
+// must be internal -- DMA buffers, anything an ISR touches -- ask for those capabilities
+// explicitly and are unaffected by this limit; it only steers plain malloc().
+#define HA_PSRAM_MALLOC_FLOOR 1024
+
 void setup() {
+    // Before anything allocates. No-op on a board without PSRAM, where there is nowhere
+    // else for these to go and the internal heap is all there is.
+    if(ESP.getPsramSize() > 0) heap_caps_malloc_extmem_enable(HA_PSRAM_MALLOC_FLOOR);
+
     serialMutex = xSemaphoreCreateMutex();
     engineMutex = xSemaphoreCreateRecursiveMutex();
     ledInit();
@@ -505,9 +806,23 @@ void setup() {
     ledSet(255, 0, 0);
     delay(150);
     ledSet(0, 0, 0);
+    WiFi.onEvent(onWiFiEvent, ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED);
+    WiFi.onEvent(onWiFiEvent, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
     Serial.setRxBufferSize(4096);
     Serial.begin(HA_UART_BAUD);
     delay(100);
+    // Mount the bundle store (formats the spiffs-labelled partition as LittleFS on first
+    // boot) and load any bundle a previous session persisted. maxOpenFiles is raised
+    // because AsyncFileResponse holds a File open per in-flight response.
+    // Before the first byte can arrive. ps_malloc prefers PSRAM (the S2) and falls back to
+    // internal heap; if even that fails there is no way to receive a frame, so say so on the
+    // wire rather than writing through a null pointer on the first byte.
+    rxBuf = (uint8_t*)ps_malloc(HA_MAX_PAYLOAD + 1);
+    if(!rxBuf) rxBuf = (uint8_t*)malloc(HA_MAX_PAYLOAD + 1);
+    if(!rxBuf) uartStatus("err_rxbuf");
+
+    fsReady = LittleFS.begin(true, "/littlefs", 16);
+    if(fsReady) assets.load();
     engine.reset();
     ledSet(0, 0, 40); // dim blue: alive, waiting for the Flipper to start a session
     uartStatus("boot");
@@ -527,15 +842,39 @@ void loop() {
     uint32_t now = millis();
     if(now - lastPing >= 2000) {
         lastPing = now;
-        // Identity beacon: magic + version, so the Flipper knows it's our firmware
-        // (and which version), not a different project on the same board.
-        uint8_t beacon[6] = {
+        // Identity beacon: magic + version + the CRC of the web bundle we hold in flash +
+        // the current game id. Version flags an outdated board; the CRC lets the Flipper skip
+        // re-streaming an unchanged bundle; the game id lets it mirror phone-vote game changes
+        // reliably. Bytes 6-10 are new in v19; bytes 11-14 (free heap KB, free PSRAM KB, LE
+        // uint16 each) are new in v1.7.1 for the Flipper's memory readout. Older Flippers read
+        // only the bytes they know and ignore the rest, so growing this stays compatible.
+        uint32_t bcrc = fsReady ? assets.bundleCrc() : 0;
+        uint16_t heapKb = (uint16_t)(ESP.getFreeHeap() / 1024);
+        uint16_t psramKb = (uint16_t)(ESP.getFreePsram() / 1024);
+        // Free heap is a snapshot and the interesting failure is a slow drain, so send the
+        // low-water mark since boot alongside it: that is what shows a leak in a way a
+        // sampled number cannot. Older Flippers read only the bytes they know.
+        uint16_t minHeapKb = (uint16_t)(ESP.getMinFreeHeap() / 1024);
+        uint8_t flags = captiveApiOk ? 0x01 : 0x00;
+        uint8_t beacon[18] = {
             HA_FW_MAGIC_0,
             HA_FW_MAGIC_1,
             HA_FW_MAGIC_2,
             HA_FW_MAGIC_3,
             (uint8_t)(HA_FW_VERSION & 0xFF),
-            (uint8_t)(HA_FW_VERSION >> 8)};
+            (uint8_t)(HA_FW_VERSION >> 8),
+            (uint8_t)(bcrc & 0xFF),
+            (uint8_t)((bcrc >> 8) & 0xFF),
+            (uint8_t)((bcrc >> 16) & 0xFF),
+            (uint8_t)((bcrc >> 24) & 0xFF),
+            engine.activeGame(),
+            (uint8_t)(heapKb & 0xFF),
+            (uint8_t)(heapKb >> 8),
+            (uint8_t)(psramKb & 0xFF),
+            (uint8_t)(psramKb >> 8),
+            (uint8_t)(minHeapKb & 0xFF),
+            (uint8_t)(minHeapKb >> 8),
+            flags};
         uartSend(HA_MSG_PING, beacon, sizeof(beacon));
     }
 }

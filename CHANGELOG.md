@@ -4,6 +4,323 @@ All notable changes to Hotspot Arcade are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.10.0] - 2026-09-10
+
+### Added
+
+- **Downloads for a single board.** A release now carries four `.fap` files instead of
+  one. `hotspot_arcade-all.fap` behaves as before, with firmware for all three boards
+  inside it. `-s2`, `-wroom` and `-c5` carry only the board they name, so the download is
+  about a third of the size and the first launch unpacks in a fraction of the time.
+  Thanks to Tyl3rA.
+- `BOARD=s2|wroom|c5 tools/build-fap.sh` builds one of those variants locally, and
+  `tools/deploy-to-flipper.py --fap <path>` pushes it to the matching folder on the SD
+  card. Thanks to Tyl3rA.
+
+### Changed
+
+- **Install Firmware lists only the boards the download actually carries.** A
+  single-board `.fap` used to offer all three rows and fail at flash time on the two that
+  were not there. The picker now reads what is bundled, and skips the menu altogether
+  when there is only one board to choose.
+- The app's folders on the SD card follow the `.fap` filename, so
+  `hotspot_arcade-all.fap` reads `/ext/apps_data/hotspot_arcade-all/` rather than
+  `/ext/apps_data/hotspot_arcade/`. If you keep your own content packs or web bundle
+  there and you move to one of the new downloads, move that folder across as well. The
+  README claimed the variants shared one folder; it is corrected.
+
+Firmware is unchanged at v22, so a board already flashed for 1.9.0 needs no reflash.
+
+## [1.9.0] - 2026-08-27
+
+### Added
+
+- **One score for the whole evening.** Games pay on wildly different scales -- a
+  trivia session runs to five figures while a werewolf win pays 1 -- so ranking
+  across them never meant anything. Every player now carries a second number that
+  does: at the end of a game you gain one point for every player you finished
+  above. A six-player win is worth five, a 1v1 win is worth one, and ties take the
+  lower value. Each game keeps its own scoring exactly as it was. The phone lobby
+  becomes a ranked cross-game board and a header chip keeps your own total on
+  screen through every game switch. Thanks to genkigenki for raising it.
+- **Reset Scores** on the Flipper, behind a confirmation, clearing both the current
+  game and the evening's totals. The Leaderboard now ranks on the evening, shows the
+  current game's score beside it, and fits a seventh row (it had been silently
+  hiding players seven and up).
+- The Flipper dashboard shows the board's heap **low-water mark**, not just its
+  current free heap. A slow drain is invisible in a sampled number and obvious in
+  the minimum.
+
+### Fixed
+
+- **The captive portal opens by itself again.** The access point was handing out an
+  address and a gateway but no DNS server, so phones could not resolve the address
+  their OS probes to decide whether a network is captive. A probe that cannot
+  resolve reads as "no internet"; only one that resolves and gets the wrong page
+  back reads as "captive". Typing 192.168.4.1 by hand always worked, which is why
+  this went unnoticed for so long.
+- **The hotspot holds up with several phones.** The board could exhaust its internal
+  memory during a session until the portal stopped answering and a second phone
+  could not finish connecting, all while nearly 2 MB of its extra memory sat unused.
+  Small allocations were being forced into the scarce pool regardless of how much
+  spare memory there was. They can now use it.
+- Renaming yourself mid-session no longer wipes your score from the host's board,
+  and a phone that drops and returns now has its score restored there too.
+- Winning at Battleship scores. It had never awarded anything at all, not even a
+  line in the host's console.
+- Playing Spectrum, Kiss Marry Kill, Secrets, Fill the Blank, Werewolf or Spyfall a
+  second time starts from zero instead of carrying the first game's scores.
+
+### Changed
+
+- Every board now builds on one ESP32 core (3.3.11), which is what makes the modern
+  captive-portal announcement available at all. Fitting the S2 needed its chess
+  tables moved into flash and its trivia content and receive buffer off static
+  memory, which left it with more headroom than it had before.
+- The bundled async networking libraries are current again, six minor versions
+  forward, covering a use-after-free on the connection-close path and two rounds of
+  WebSocket fixes.
+
+### Known limitation
+
+- iOS does not show its persistent "Log In" entry for the portal. The relevant
+  standard requires the portal be reached over TLS, and an access point like this
+  has no certificate a phone would trust. The portal still opens on its own.
+
+## [1.8.0] - 2026-08-11
+
+### Added
+
+- **Four new games, twenty in all.** Thanks to genkigenki.
+
+- **Fill the Blank**, a 17th game (whole-group). A prompt card with a blank goes up and
+  everyone except the rotating Czar plays one answer card from their hand, face down — the
+  card stays put, marked as the one you chose, with the rest of the hand greyed out and
+  unselectable. The played cards come back shuffled and anonymous, and the Czar picks the
+  funniest. Six rounds, then the usual podium. Hands refill each round and used cards are
+  reshuffled back into the draw pile, so a long game never runs out. Inspired by Cards
+  Against Humanity — the cards shipped with it are original, written for this project,
+  and there is no affiliation with that game. Content comes from the new `fillblank`
+  packs (a `P:` block is a prompt card, an `A:` block an answer card). Ships with English
+  and German phone UI. Firmware **v19**.
+
+  Two things make the judging more than a formality. Every round shuffles in **one extra
+  answer card drawn at random from the deck**, judged blind next to the players' cards and
+  indistinguishable from them until the pick — and if the Czar picks it, **nobody scores**,
+  because the deck beat the room. And the Czar **also scores 1** when they land on a real
+  player's card, so judging well is worth something instead of being an arbitrary tap.
+
+  The reveal then names everyone: every card is shown with the player who played it (the
+  deck's card labelled as the deck's), with the winning card called out and its +1. Nothing
+  about authorship reaches any client before the Czar has chosen — not the names, and not
+  which card the deck contributed.
+
+- **Werewolf**, an 18th game (whole-group party). The phones are the referee, not a chat
+  client: they deal the secret roles — about one werewolf per four players, one seer, one
+  doctor from six players up, the rest villagers — and run the night/day clock, while the
+  deduction happens out loud in the room. Night (a fixed 60s): the werewolves converge on a
+  victim, the seer privately checks one player, and the doctor shields one, which makes the
+  attack fail. Day (60s + 20s per living player, 90–240s): the outcome is announced with
+  the dead player's role, then the village votes someone out — early on a majority hammer,
+  and a tied vote hangs nobody. Villagers win when the last wolf is gone, werewolves when
+  they are no longer outnumbered; every player still alive on the winning side scores 1.
+  Needs five players; no content packs. Ships localized in English and German. Firmware
+  **v19** (game id `18`).
+
+  Secrecy is enforced server-side: the per-player serializer only tells a phone what it is
+  entitled to know, so a role never appears in another player's payload before a legitimate
+  reveal (death or game end), and the seer's reading, the doctor's shield and the pack's
+  tally are gated the same way. The night is deliberately a *fixed* window — a night that
+  ended as soon as every special had acted would tell the room how many are still alive —
+  and nothing is ever announced about a player failing to act. The pack's tally is pushed
+  live on every tap, because players are in the same room and the phone is the wolves' only
+  way to coordinate. At six players or fewer the first night takes nobody, so a small table
+  does not collapse to four players before anyone has learned anything.
+
+- **Spyfall**, a 19th game (whole-group). Everyone at the table shares a secret location
+  and holds a role there; one player is the spy and is told neither, seeing only the list
+  of possible locations. The round is driven by players pressing things, not by a clock:
+  read your card and tap OK (the six minutes only start once every phone has, so nobody is
+  still reading when the questioning begins), then **Show my card** reveals it again only
+  while the button is held down. At any moment **I know the spy** (open to every player
+  including the spy, as cover) ends the round if it lands, or spends that player's one
+  accusation for the round if it misses; **I know the location** is the spy's gamble.
+  Running the clock out does not end the round -- the table goes round one seat at a time
+  nominating a suspect, and a nomination only stands if as many players back it as there
+  are non-spies. If every seat nominates in vain the spy wins. Four rounds with a rotating
+  spy, then the usual podium. Every outcome is worth exactly 1 point, so the shared
+  leaderboard stays flat. Minimum three players. Firmware **v18**.
+- **Spyfall content packs**: three English (`Everyday`, `On the Move`, `Backstage`) and
+  the same three in German, 14 locations each with five or six roles apiece. The pack
+  format extends the generic `Key: value` grammar with a `Loc:` line followed by one `R:`
+  line per role.
+- `ha_json_str_nth()` / `ha_json_find_nth()` in the ESP's JSON helpers, for content blocks
+  that legitimately repeat a key (the Flipper streams one JSON pair per source line, so
+  Spyfall's several `R:` lines arrive as the same key repeated).
+- `spyfall` joins the Flipper's `EVENT` key chain, so a missed accusation shows up in the
+  host console (the same seam Battleship was once silently missing from).
+- **Draw a Monster**, a 20th game (whole-group, id `20`, `frankendraw` internally and on
+  the wire): the exquisite-corpse drawing
+  game. Everyone starts a sheet and draws a head; the sheets rotate one seat a round so
+  the torso and the legs are drawn by two other players, and the only thing a drawer
+  ever sees of the panel above theirs is a thin overlap sliver — enforced in the
+  per-player serializer, not the client — plus a faint join mark showing roughly where
+  the neck or the hips should land. Everyone draws at once behind a 75-second timer that
+  ends early once all have tapped Next. Undo and Next sit above the canvas with an ink
+  bar between them, so the controls can never be scrolled out of reach and a panel
+  running out of its segment budget is visible before it happens. The finished creatures
+  then walk past one at a time, five seconds each, with a name label on every band and
+  thumbs-up / thumbs-down buttons whose counts the whole room watches move live; the best
+  net score wins, is shown again as the finale, and pays its three drawers. Needs three
+  players; no content packs. Firmware **v20**.
+- A **finished-artwork sink** (`haUartArt`) and its UART report `ART` (`0x87`): a
+  completed sheet is streamed to the host as begin / one frame per line segment / end,
+  so neither the ESP nor the Flipper ever buffers a drawing. The Flipper writes each
+  sheet straight out as an **SVG** under `/ext/apps_data/hotspot_arcade/art/`, one file
+  per creature, named so a session's set groups together.
+- The phone bundle is served with an ETag and answers `If-None-Match` with a 304, so
+  reloads and captive re-probes no longer re-download the whole ~47 KB bundle.
+- The Flipper dashboard shows the ESP board's free heap and PSRAM, so memory health
+  is visible at a glance.
+- Play-test polish: the phone opens in the host's language, audio unlocks for an
+  auto-rejoined player, and the Secrets stepper no longer ticks away the hidden vote.
+
+### Fixed
+
+- **The hotspot no longer freezes under load.** Serving the phone bundle repeatedly
+  exhausted and fragmented the ESP32-S2's small internal heap until the web server
+  could no longer accept connections — the Wi-Fi stayed up but pages stopped loading
+  and the board needed a power-cycle. The official S2 dev board has ~2 MB of PSRAM
+  that the firmware never enabled; turning it on moves the Wi-Fi and serving buffers
+  off the internal heap, which now holds steady all session. (Boards without PSRAM
+  still need the underlying serve-path fix — tracked separately.)
+- **Reconnecting keeps your score.** A returning phone is now recognized by a stable
+  id it stores itself, so it restores correctly even when iOS hands out a fresh
+  randomized Wi-Fi MAC (after "Forget This Network" or an OS change).
+
+- **`flipper/hotspot-arcade/assets/web/` was left stale**, which made Werewolf look like it
+  did not exist: that directory (not `web/dist/`) is what the Flipper streams to the ESP and
+  serves to phones, so the room got the pre-Werewolf page. It had no `werewolf` entry in
+  `GAME_SCREEN`, and the lobby's route guard is `... && GAME_SCREEN[g]`, so selecting the
+  game routed nowhere and its state pushes hit `dispatch()` with no registered handler —
+  phones sat in the lobby forever with no error. Refreshed, and the trap is now closed from
+  three sides: `tools/pr-check.mjs` gained a HARD check mirroring the `bundled-assets` CI
+  job, CONTRIBUTING says to copy the bundle over, and the phone now says "the host picked
+  <game>, which this page does not have" instead of silently doing nothing when the board
+  offers a game the served page has never heard of.
+- The Werewolf lobby now always states why it is waiting — "Needs 5 players, 3 here", or
+  "2 of 6 still to tap ready". A silent lobby is indistinguishable from a broken game, which
+  is how a below-quorum room would have been reported next.
+
+## [1.7.0] - 2026-08-05
+
+### Added
+
+- **Secrets**, a 16th game (whole-group). Each round shows a yes/no question and runs
+  answer → predict → reveal: every player first secretly answers yes/no, then secretly
+  predicts how many of the group said yes (0..N). Only the group's total yes-count is ever
+  revealed — the individual answers are never serialized to anyone, enforced server-side in
+  the per-player serializer; predictions (guesses about the group, not personal) are shown
+  at reveal. An exact prediction scores 1, anything else 0. Six rounds, on the shared
+  party lobby/countdown/reveal skeleton, with a votable pack of questions. Ships localized
+  (English + German). Firmware **v18**.
+- **Phone-side game-change vote.** Any player can propose switching the active game from
+  their phone (a 🕹️ button in the header, and the lobby's "Pick a game" row, open a
+  game picker); the ESP then freezes the active game and runs a majority vote of the
+  *other* players, resuming the game on reject/timeout or switching on approve. The
+  proposer is an implicit yes; approval needs a strict majority of the others (a lone
+  proposer switches at once); a No majority or a 25s timeout rejects, the proposer can
+  withdraw their own proposal, and the proposer leaving cancels it. The picker's last
+  entry, **Back to Lobby**, proposes leaving the current game and is voted on the same
+  way. This is the one sanctioned phone→host action, gated entirely behind the vote — a
+  host-initiated select stays authoritative and immediate. New intents
+  `proposeGame{game}` / `voteGame{ok}` and a `gamevote` push. Firmware **v18**.
+- **Would You Rather: an agreement chart on the final screen.** The game used to end with
+  nothing to talk about; now it closes with a distribution of how strongly the group
+  agreed. Agreement per round is the majority share (`max(a,b)/(a+b)`), so a 1/9 split
+  reads as 90% just like 9/1 and the value never drops below 50%. The horizontal axis is
+  the set of percentages actually reachable with the current number of voters
+  (`ceil(n/2)/n … n/n` — 50/60/70/80/90/100 for ten players), each bar counts the rounds
+  that landed there, and a dashed line marks the mean with its value, e.g. "You align on
+  average by 62% — lots to talk about!". Rounds nobody voted in are skipped rather than
+  counted as unanimous. The ESP is the source of truth: `wyrJson()`'s `"final"` phase now
+  carries `voters` and a `rounds` array of `{a,b}` splits, because a phone that joined
+  late never saw the earlier rounds. Firmware **v18**.
+- A serial trace of every identity decision, for debugging on real hardware:
+  `[ha] JOIN pid=2 ip=192.168.4.3 mac=AA:BB:CC:DD:EE:FF nick="..."` for a new device, and
+  `[ha] NEW BROWSER same device ip=... mac=... -> pid=1 nick="..." (consolidated)` when a
+  second browser context is folded onto the player that phone already has.
+
+### Changed
+
+- **The web bundle lives in ESP flash, not RAM.** It used to be streamed from the Flipper
+  into a heap buffer every session and held there; it is now written once into a
+  **LittleFS** flash partition (the `spiffs`-labelled data partition every board already
+  reserves) as it streams, and served from flash — freeing ~47 KB of heap. The ESP
+  advertises the stored bundle's **CRC32** in its PING beacon and the Flipper **skips
+  re-streaming** when its copy already matches (a changed bundle, or a user override in
+  `apps_data/.../web`, still streams). Firmware **v19**; the PING beacon and `manifest.json`
+  gained a bundle-CRC field.
+- Content packs now allow **8 topics per game**, up from 6, using some of the heap the
+  flash bundle freed.
+
+- `sim/`: each simulated socket now carries a stub device key (one per socket, so every
+  panel stays its own phone), with `ha_ws_device()` to put two sockets on one phone. New
+  headless test `sim/test/identity.mjs` covers rebind, distinct devices, the stale-socket
+  disconnect, and the unknown-device fallback.
+
+### Fixed
+
+- **The AP no longer exhausts RAM and reboots when phones associate.** The ~47 KB web
+  bundle grew across sixteen games; held in heap it left too little for the Wi-Fi/TCP
+  stack, so a couple of Wi-Fi associations could crash the board and drop the AP mid-join
+  ("unable to join" / "192.168.4.1 times out"), worst in RF-dense areas. Moving the bundle
+  to flash (above) fixes it. Firmware **v19**.
+- **A phone-voted game change now shows on the Flipper.** Switching the game from a phone
+  updated the ESP and the other players but left the Flipper's dashboard showing the old
+  game (and an ESP reboot could revert the vote). The PING beacon now carries the ESP's
+  current game id and the Flipper mirrors it while hosting, so any game change — by vote or
+  by the host — reflects on the dashboard within one beacon. Firmware **v19**.
+- **The phone game plays in the iOS captive pop-up, not just the full browser.** The captive
+  window is served the real app now (it's a WebKit view), while the OS's background
+  captive-detection probes get a tiny "open 192.168.4.1 in your browser" landing — so
+  serving the ~47 KB bundle to the burst of probes no longer starves the ESP's heap.
+- **Would You Rather's agreement chart no longer misreads a divided group.** With few voters
+  a round can only land at 50% or 100%, so a half-unanimous/half-split game averaged to a
+  meaningless "75% — like-minded" with a marker in an empty gap. It now detects that
+  polarization, drops the mean marker, and says "Split down the middle — N unanimous, M
+  split." Localized (en/de/pt-BR).
+- **One phone = one player.** A player is now bound to the device rather than to the
+  WebSocket, so a phone can no longer show up as two or three players. iOS opens the portal
+  in a captive mini-browser whose storage is separate from Safari's, so playing in both (or
+  in a second tab, or a second browser) used to create a player per context. A `hello` from
+  a device that is already playing now rebinds the existing player to the new socket — never
+  a second player — keeping their pid, name, avatar and score, and the `welcome` reply hands
+  that identity to the new context (it now carries `avatar` alongside `pid`/`nick`, and the
+  client adopts and stores both) so it shows the same name straight away. Firmware **v18**.
+
+  The device is identified by the station's **MAC**, not by its IP: the IP is assigned by
+  the ESP's own DHCP server and is a derived value, while the MAC is the device. The AP's
+  DHCP events report the assigned address together with the client MAC, so the firmware
+  keeps a small IP → MAC table; a station whose lease predates the handler is resolved from
+  lwIP's ARP cache, and if the MAC cannot be resolved at all the IP is used as the key.
+  (Phones use a randomized private MAC these days, but it is stable per SSID, so it lasts
+  exactly as long as a session does.) The engine itself just stores an opaque 64-bit device
+  key and knows nothing about MACs or IPs.
+- **No more ghost players from a stale socket.** A phone that drops (screen lock, WiFi off)
+  closes nothing — the ESP only sees the socket die when TCP times out, minutes later. A
+  disconnect now removes a player only if the closing socket is still that player's
+  *current* socket, so a phone that reconnected in the meantime is no longer taken down by
+  its own stale connection.
+
+  Deliberate trade-off: two people can no longer share one phone as two players.
+- **A dead link now shows the reconnect bar** instead of the page looking connected while
+  the round moves on. A phone dropping (WiFi off, sleep) often produces no socket close for
+  minutes; the client now tracks how long the host has been silent and surfaces the existing
+  reconnect UI once it goes quiet. Client-only.
+
 ## [1.6.0] - 2026-08-03
 
 Chess joins as the fifteenth game. Firmware **v17**.
@@ -386,7 +703,8 @@ an official ESP32-S2 WiFi dev board. No internet and no app install required.
   for previewing the web client through lobby, trivia, and Connect Four in a desktop browser.
 - **CI**: a build workflow that compiles all three parts on every push and pull request.
 
-[Unreleased]: https://github.com/tarikbc/hotspot-arcade/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/tarikbc/hotspot-arcade/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/tarikbc/hotspot-arcade/compare/v1.9.0...v1.10.0
 [1.1.2]: https://github.com/tarikbc/hotspot-arcade/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/tarikbc/hotspot-arcade/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/tarikbc/hotspot-arcade/compare/v1.0.1...v1.1.0

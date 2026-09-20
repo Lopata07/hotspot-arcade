@@ -1,3 +1,64 @@
+## 1.10.0
+
+- Pick a smaller download. Releases now offer a .fap per board alongside the combined one.
+  If you know you have the official S2 dev board, the WROOM, or the C5, that build carries
+  only your board's firmware: about a third of the size, and a much quicker first launch.
+  The combined hotspot_arcade-all.fap still flashes any of the three. Thanks to Tyl3rA.
+- Install Firmware lists only the boards your download can actually flash, instead of
+  offering three and failing on the two that are not there.
+- If you keep your own content packs on the SD card, note the app's folder is named after
+  the .fap file. Moving to hotspot_arcade-all.fap means moving your packs from
+  apps_data/hotspot_arcade/ to apps_data/hotspot_arcade-all/.
+- The board firmware is unchanged, so there is no need to reflash your board.
+
+## 1.9.0
+
+- One score for the whole evening. Games pay on very different scales, so a ranking across
+  them never meant much. Now, at the end of any game, you gain a point for every player you
+  finished above: win a six-player round and that is five, win a one-on-one and that is one.
+  Each game keeps its own scoring exactly as it was. The phone lobby becomes a ranked board
+  between games and a badge keeps your running total on screen while you play. Thanks to
+  genkigenki for raising it.
+- The join page opens by itself again. The hotspot was handing out an address but never
+  telling phones where to look up names, so phones decided there was simply no internet and
+  never offered the portal. Typing 192.168.4.1 by hand always worked, which is why this
+  went unnoticed for so long.
+- Holds up with several phones. A busy session could run the board out of usable memory
+  until the page stopped loading and a second phone could not finish connecting, while
+  nearly 2 MB of the board's spare memory sat unused. It can use that memory now.
+- New Reset Scores control on the Flipper, and the Leaderboard now ranks on the evening's
+  total, shows the current game beside it, and fits one more player on screen.
+- Renaming yourself mid-game no longer wipes your score on the Flipper, a phone that drops
+  and comes back keeps it, and winning at Battleship finally scores at all.
+
+## 1.8.0
+
+- Four new games, twenty in all. Fill the Blank: a prompt with a gap, everyone answers
+  from a hand of cards, a rotating judge picks the funniest. Werewolf: hidden roles,
+  night and day, with a seer and a doctor. Spyfall: everyone shares a secret location and
+  a role there except one spy, who must blend in. Draw a Monster: everyone draws one panel
+  of a creature blind, and the finished sheet arrives on the Flipper. Thanks to genkigenki.
+- Fixes a freeze under load: hosting a busy session used to slowly run the board out of
+  memory until the hotspot stopped serving pages and needed a power-cycle. The official
+  ESP32-S2 board's spare PSRAM is now used, so memory stays healthy all session. Boards
+  without PSRAM still need a further fix.
+- Reconnecting keeps your score, even when the phone changes its Wi-Fi address.
+- The phone game loads faster on a reload, and the Flipper dashboard now shows the board's
+  free memory.
+
+## 1.7
+
+- New game: Secrets, the sixteenth (whole-group). Each round poses a yes/no question that
+  everyone answers secretly, then everyone predicts how many of the group said yes — only
+  the group total is ever revealed, never who said what.
+- Players can now vote from their phones to switch the active game (a majority of the other
+  players), with a "Back to Lobby" option too. A host pick stays instant and authoritative.
+- Would You Rather ends with an agreement chart showing how closely the group aligned.
+- More reliable hosting: the phone web app is now kept in the board's flash instead of RAM,
+  so the hotspot no longer runs low on memory and drops connections as more phones join.
+  Trivia and party packs also allow up to eight topics per game.
+- Firmware v19.
+
 ## 1.6
 
 - New game: Chess, the fifteenth. Full FIDE rules refereed on the board: castling, en
@@ -11,7 +72,8 @@
 
 - The phone UI is fully localized: the host's language reaches every phone, with
   Brazilian Portuguese first and English as the fallback for anything untranslated.
-  Content packs can ship per-language versions (packs/<game>/<lang>/).
+  Content packs can ship per-language versions, placed in a language subfolder
+  under each game's pack folder.
 - Firmware v16.
 
 ## 1.4

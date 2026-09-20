@@ -29,16 +29,16 @@ jobs:
           arduino-cli config init --overwrite
           arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@2.0.17
+          arduino-cli core install esp32:esp32@3.3.11
           arduino-cli compile \
-            --fqbn esp32:esp32:esp32s2:PartitionScheme=huge_app \
+            --fqbn esp32:esp32:esp32s2:PartitionScheme=huge_app,PSRAM=enabled,CDCOnBoot=default \
             --libraries esp32/libs \
             --output-dir esp32/hotspot-arcade-fw/build \
             esp32/hotspot-arcade-fw
           # Merge the four flashable images into a single firmware-merged.bin
           # (flashable at 0x0), so the release ships one ESP image instead of four.
           BUILD=esp32/hotspot-arcade-fw/build
-          BOOT_APP0="$HOME/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/boot_app0.bin"
+          BOOT_APP0="$HOME/.arduino15/packages/esp32/hardware/esp32/3.3.11/tools/partitions/boot_app0.bin"
           # The core ships esptool differently per platform: a standalone binary on
           # macOS, but on Linux "esptool" is the Python *package directory*, with the
           # entry point at esptool.py beside it. Resolve both, and fail loudly rather
@@ -71,17 +71,14 @@ jobs:
             0x8000  "$WBUILD/hotspot-arcade-fw.ino.partitions.bin" \
             0xe000  "$BOOT_APP0" \
             0x10000 "$WBUILD/hotspot-arcade-fw.ino.bin"
-          # And the ESP32-C5. It needs a 3.x core (the chip does not exist in 2.0.17),
-          # so it gets its own core install, its own boot_app0, and its own bootloader
-          # offset (0x2000 on this chip, not 0x1000).
+          # And the ESP32-C5, on the same core as everything else now. It still needs its
+          # own bootloader offset (0x2000 on this chip, not 0x1000).
           #
-          # NOTE: installing the 3.x core *replaces* esp32@2.0.17 and uninstalls its
-          # esptool 4.5.1 (the one $ESPTOOL above points at), so we can no longer reuse
-          # $ESPTOOL here. Rather than re-resolve a moving esptool, merge the images
-          # ourselves: raw merge_bin is just each image placed at its flash offset with
-          # 0xFF fill between them (verified byte-identical to esptool's output). This is
-          # why the S2/WROOM merges run *before* this core install.
-          arduino-cli core install esp32:esp32@3.3.11
+          # The core install that used to sit here is gone: every board is on 3.3.11, so
+          # nothing replaces anything and the S2/WROOM merges no longer have to run first.
+          # The hand-rolled merge below stays as it is -- raw merge_bin is each image at its
+          # flash offset with 0xFF fill between, verified byte-identical to esptool's
+          # output, and there is no reason to re-cut a release artifact just to tidy it.
           CBUILD=esp32/hotspot-arcade-fw/build-c5
           C5_CORE="$HOME/.arduino15/packages/esp32/hardware/esp32/3.3.11"
           C5_BOOT_APP0="$C5_CORE/tools/partitions/boot_app0.bin"
@@ -131,11 +128,26 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build Flipper app (fap)
+      - name: Build Flipper apps (fap) — all four variants
         run: |
           pip install --upgrade ufbt
           ufbt update --index-url=https://up.momentum-fw.dev/firmware/directory.json --channel=release --hw-target=f7
-          cd flipper/hotspot-arcade && ufbt
+
+          FWDIR=flipper/hotspot-arcade/assets/firmware
+          mkdir -p /tmp/firmware-full
+          cp -r "$FWDIR"/. /tmp/firmware-full/
+
+          (cd flipper/hotspot-arcade && ufbt)
+          cp flipper/hotspot-arcade/dist/hotspot_arcade.fap flipper/hotspot-arcade/dist/hotspot_arcade-all.fap
+
+          declare -A dirmap=( [s2]=official_devboard [wroom]=wroom [c5]=c5 )
+          for board in s2 wroom c5; do
+            dir="${dirmap[$board]}"
+            rm -rf "$FWDIR"/*
+            cp -r "/tmp/firmware-full/$dir" "$FWDIR/$dir"
+            (cd flipper/hotspot-arcade && ufbt)
+            cp flipper/hotspot-arcade/dist/hotspot_arcade.fap flipper/hotspot-arcade/dist/hotspot_arcade-"$board".fap
+          done
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -147,28 +159,43 @@ jobs:
             Offline multiplayer party games hosted from a Flipper Zero + an ESP32 WiFi board (S2, WROOM, or C5).
 
             ## Install
-
-            **You only need `hotspot_arcade.fap`.** Drop it in `/ext/apps/GPIO/` on the SD card.
-            The ESP firmware, the phone game bundle, and the content packs all ship inside it, so
-            there is no SD setup and nothing else to download. Flash the board from the app itself
-            with **Install Firmware**.
-
+ 
+            Pick **one** `.fap`, not several — they all install as the same app. Drop it in
+            `/ext/apps/GPIO/` on the SD card. The ESP firmware, the phone game bundle, and the
+            content packs all ship inside it, so there is no SD setup and nothing else to
+            download. Flash the board from the app itself with **Install Firmware**.
+ 
+            - **Not sure which board you have, or want to keep your options open?** Use
+              `hotspot_arcade-all.fap`. It carries firmware for all three boards (S2, WROOM, C5),
+              so **Install Firmware** can flash whichever one you plug in, and you can switch
+              boards later without reinstalling.
+            - **Know your board already?** Use the matching one —
+              `hotspot_arcade-s2.fap`, `hotspot_arcade-wroom.fap`, or `hotspot_arcade-c5.fap`.
+              Each carries only that board's firmware, so it's a smaller download and a faster
+              first unpack than the combined `-all` build.
+ 
             > **First launch can take up to 3 minutes** (and again after an update). The .fap
-            > carries about 3 MB of bundled content (three board firmwares, the phone game bundle,
-            > the content packs) and the Flipper unpacks it to the SD card on first open. The
-            > hourglass is the system loader doing that, not a hang, so give it a minute or two.
-            > Every launch after that is instant.
-
+            > unpacks its bundled content (board firmware, the phone game bundle, the content
+            > packs) to the SD card on first open — more content in `-all` than in a single-board
+            > fap, so `-all` takes a bit longer. The hourglass is the system loader doing that,
+            > not a hang, so give it a minute or two. Every launch after that is instant.
+ 
             ## Assets
-
-            - `hotspot_arcade.fap`: the whole thing. This is the one you want.
+ 
+            - `hotspot_arcade-all.fap`: bundles firmware for all three boards (S2, WROOM, C5).
+              Pick this if you're unsure which board you have or want to swap boards later.
+            - `hotspot_arcade-s2.fap`: bundles firmware for the ESP32-S2 dev board only. Smaller
+              and faster to unpack than `-all` if that's the board you're flashing.
+            - `hotspot_arcade-wroom.fap`: bundles firmware for the ESP32 WROOM board only.
+            - `hotspot_arcade-c5.fap`: bundles firmware for the ESP32-C5 board only.
             - `firmware-merged.bin`: the ESP32-S2 firmware as a single image, if you'd rather flash
-              that board from a computer (optional — the fap already carries it).
-            - `wroom-merged.bin`: the same, for an ESP32 WROOM board (optional — the fap carries it too).
-            - `c5-merged.bin`: the same, for an ESP32-C5 board.
+              that board from a computer (optional — the S2 fap and the `-all` fap already carry it).
+            - `wroom-merged.bin`: the same, for an ESP32 WROOM board (optional — the WROOM fap and
+              the `-all` fap already carry it).
+            - `c5-merged.bin`: the same, for an ESP32-C5 board (optional — the C5 fap and the
+              `-all` fap already carry it).
             - `web-bundle.zip`: the phone game bundle on its own, for overriding the bundled client
               from `/ext/apps_data/hotspot_arcade/web/` (optional).
-
             ## Flash the ESP board from a computer (optional)
 
             Or skip this entirely and use **Install Firmware** on the Flipper — it flashes any of the boards.
@@ -184,13 +211,18 @@ jobs:
 
             ```sh
             esptool.py --chip esp32 --before default_reset --after hard_reset write_flash 0x0 wroom-merged.bin
-
-            ESP32-C5:
-
+            ```
+            
+            **ESP32-C5:**
+            
+            ```sh
             esptool.py --chip esp32c5 --before default_reset --after hard_reset write_flash 0x0 c5-merged.bin
             ```
           files: |
-            flipper/hotspot-arcade/dist/hotspot_arcade.fap
+            flipper/hotspot-arcade/dist/hotspot_arcade-all.fap
+            flipper/hotspot-arcade/dist/hotspot_arcade-s2.fap
+            flipper/hotspot-arcade/dist/hotspot_arcade-wroom.fap
+            flipper/hotspot-arcade/dist/hotspot_arcade-c5.fap
             web/web-bundle.zip
             esp32/hotspot-arcade-fw/build/firmware-merged.bin
             esp32/hotspot-arcade-fw/build-wroom/wroom-merged.bin

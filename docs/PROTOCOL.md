@@ -79,31 +79,50 @@ All control messages are framed so the link can resync after noise:
 | 0x80 | STATUS       | token: `boot` `files_ok` `ap_ok` `up ip=..` `stopped` `err ..` |
 | 0x81 | JOIN         | `pid(1)` `nick` — a player joined |
 | 0x82 | LEAVE        | `pid(1)` |
-| 0x83 | SCORE        | `pid(1)` `delta(2 LE, signed)` `reason` — authoritative-persist on Flipper |
+| 0x83 | SCORE        | `pid(1)` `delta(2 LE, signed)` `reason` — the CURRENT game's score, as a delta the Flipper accumulates. Zeroed on both ends by SELECT_GAME. |
 | 0x84 | ROUND_RESULT | JSON, game-specific (trivia: `{"correct":[pid..]}`, c4: `{"win":pid,"lose":pid}` or `{"draw":[a,b]}`) |
 | 0x85 | EVENT        | JSON for host display, e.g. `{"answers":3,"total":5}` or `{"c4":"A vs B started"}` |
-| 0x86 | PING         | identity beacon ~every 2s: `magic(4)` + `version(2 LE)`. `magic` = `48 41 52 43` ("HARC"); the Flipper only treats a magic-matched PING as "our board present", and flags `version < HA_FW_VERSION` as an outdated board to update. |
+| 0x86 | PING         | identity beacon ~every 2s: `magic(4)` + `version(2 LE)` + `bundleCrc(4 LE, v19+)` + `game(1, v19+)` + `heapKb(2 LE, v20+)` + `psramKb(2 LE, v20+)`. `magic` = `48 41 52 43` ("HARC"); the Flipper only treats a magic-matched PING as "our board present", and flags `version < HA_FW_VERSION` as an outdated board to update. `bundleCrc` is the CRC-32/IEEE of the web bundle the ESP holds in flash (0 = none); the Flipper skips re-streaming when it equals the manifest's `crc`. `game` is the ESP's current game id (`HA_GAME_*`); while hosting the Flipper mirrors it (ignoring 0/NONE) so a phone-vote game change reflects on the dashboard reliably — the beacon always arrives, unlike a one-off EVENT. `heapKb`/`psramKb` are the board's free internal heap and free PSRAM in KB (0 = no PSRAM), shown on the dashboard. v22 appends `minHeapKb(2 LE)` + `flags(1)`: the heap low-water mark since boot, which is what reveals a slow drain that a sampled figure hides, and a flags byte whose bit 0 means the RFC 8910 captive-portal option was accepted by the DHCP server this session. Older boards send shorter beacons; every field is length-guarded (backward-compatible). |
+| 0x87 | ART          | finished artwork, streamed: `op(1)` + JSON. `op` 0 = begin a sheet (`{"game":"frankendraw","id":n,"w0":"..","w1":"..","w2":".."}` — the three panels' drawers), 1 = one line segment (`{"p":panel,"x0":..,"y0":..,"x1":..,"y1":..}`, 0..255 sheet units), 2 = end (`{"id":n}`). One frame per segment: the picture is streamed as it is finished, so neither side ever buffers a drawing. The Flipper writes each sheet to `/ext/apps_data/hotspot_arcade/art/fd-<YYMMDD-HHMMSS>-<n>.svg`. |
+| 0x88 | TOTAL        | `pid(1)` `total(4 LE, signed)` — a player's CROSS-GAME total (v21+), sent **absolute**, not as a delta. Emitted whenever a total moves: a game finish, a 1v1 win, a rejoining player's restore, a host reset. Absolute is the point: SCORE is a delta stream and the Flipper's copy drifts from the board's (a rename re-announce zeroes it, SELECT_GAME zeroes only the ESP side, and an unparked player's score is restored without the host hearing), whereas a replaced value cannot. |
 
 ### 1.3 Raw-bulk escape (asset upload)
 
 `FILE_BEGIN` is a normal control frame; immediately after its CRC, the sender
 writes exactly `total` **unframed** bytes (the file content, possibly gzipped).
-The receiver switches to a raw-read state, counts down `total`, stores the bytes,
-then returns to frame parsing. This mirrors flytrap's `sethtml <N>\n` + N bytes,
-generalized to named files. Bulk bytes need no escaping because the length is known.
+The receiver switches to a raw-read state, counts down `total`, **writes the bytes to a
+LittleFS flash partition** (not RAM), then returns to frame parsing. This mirrors flytrap's
+`sethtml <N>\n` + N bytes, generalized to named files. Bulk bytes need no escaping because
+the length is known.
+
+One size cap applies, on the **sender**: the Flipper reads the whole file into RAM to
+stream it, capped at `HA_FILE_MAX` (`hotspot_arcade_i.h`, 73728) — which MUST equal
+`CEIL` in `web/build.mjs`. An oversized file is refused loudly ("web asset too big")
+rather than truncated; when the pair once drifted, a silently clipped gzip served every
+phone a page whose scripts never arrived. The `bundled-assets` CI job asserts the pair.
 
 ### 1.4 Handshake (session start)
 
 ```
 Flipper                         ESP
-  |-- CLEAR_FILES -------------->|
-  |-- FILE_BEGIN + bytes (xN) -->|   (index.html.gz, app.js.gz, app.css.gz, ...)
+  |-- CLEAR_FILES -------------->|   (skipped when the bundle is unchanged, see below)
+  |-- FILE_BEGIN + bytes -------->|   index.html.gz -> ESP writes it to LittleFS flash
+  |-- (content packs) ---------->|   trivia/party packs (always streamed)
   |-- SET_AP ------------------->|
   |-- START -------------------->|
   |<------------- STATUS ap_ok --|
   |<------------- STATUS up ip=..|   AP live, phones can join
 ```
-Then live: JOIN/LEAVE/SCORE/EVENT/ROUND_RESULT flow up; SELECT_GAME/QUESTION/
+The ESP persists the streamed bundle in flash and serves it from there, so it survives a
+reboot. It advertises the bundle's CRC-32 in every PING (§1.2); when that equals the `crc`
+in the Flipper's `manifest.json`, the Flipper **skips `CLEAR_FILES` and the whole file
+stream**, jumping straight to the content packs + `SET_AP` — the board reuses the copy it
+already holds (no ~47 KB re-transfer per session). A changed bundle, or an
+`apps_data/.../web` override whose manifest carries a different/absent `crc`, streams
+normally and overwrites the stored copy. Skipping is an optimization only: the ESP always
+writes+serves from flash, so an older Flipper that always streams still works.
+
+Then live: JOIN/LEAVE/SCORE/TOTAL/EVENT/ROUND_RESULT flow up; SELECT_GAME/QUESTION/
 REVEAL/ROUND_END flow down as the host drives rounds. PING beacons throughout.
 
 ---
@@ -131,7 +150,7 @@ REVEAL/ROUND_END flow down as the host drives rounds. PING beacons throughout.
 
 | `t`      | Fields | Meaning |
 |----------|--------|---------|
-| `welcome`| `pid`, `nick`, `lang` | Assigned player id after `hello`; `lang` is the host's phone-UI language (`""` = English), which the client uses to pick its message catalog |
+| `welcome`| `pid`, `nick`, `avatar`, `lang` | Assigned player id after `hello`, with the identity the server holds for this device (see §10 — on a rebind these are the existing player's, not what the client just sent); `lang` is the host's phone-UI language (`""` = English), which the client uses to pick its message catalog |
 | `lobby`  | `game` ("none"/"trivia"/"connect4"), `players` (`[{pid,nick,score}]`), `me` (pid) | Lobby snapshot; sent on change |
 | `trivia` | `phase` ("idle"/"question"/"reveal"), `i`, `q`, `o` (opts), `dur`, `deadline` (ms epoch-ish, server `millis`), `mine` (my choice or -1), `counts` ([n0..n3]), `correct` (reveal only), `scores` | Full trivia view for this client |
 | `c4`     | `phase` ("lobby"/"playing"/"over"), lobby: `challenges` (`[{from,to}]`); playing: `mid`, `board` (42 ints: 0 empty/1/2), `turn` (pid), `me` (1 or 2), `opp` (nick), `you` (pid); over: `result` ("win"/"lose"/"draw") | Full connect4 view for this client |
@@ -144,10 +163,21 @@ referee for scoring; the client bar is cosmetic).
 
 ### 2.3 Scoring split
 
-The ESP scores the live session (speed+correctness for trivia, win/draw for c4)
-and (a) keeps a **live mirror** it broadcasts to phones in `players[].score`, and
-(b) reports each delta to the Flipper via UART `SCORE` for the host display and
-persistent leaderboard. Both stay consistent because every delta is reported.
+Every player carries **two** numbers, and they answer different questions.
+
+`score` is the current game only. The ESP scores the live session (speed+correctness for
+trivia, win/draw for c4), broadcasts it to phones in `players[].score`, and reports each
+change to the Flipper as a `SCORE` delta. `SELECT_GAME` zeroes it on both ends, and each
+game's own board and podium rank on it.
+
+`total` is the evening across every game (v21+). Games score on wildly different scales --
+a trivia session runs to five figures, a werewolf win pays 1 -- so `score` can never be
+ranked across games. At a finish the ESP converts the standings into **opponents beaten**:
+one point per player you finished above, ties taking the lower value, so a 6-player win is
+worth 5 and a 1v1 win is worth 1. Bots are neither counted nor credited. A game that bails
+out before its first round pays nobody. `total` survives game switches and reconnects, is
+carried in `players[].total` and in each final's `board[]`, and reaches the Flipper as an
+absolute `TOTAL` frame. Only a host reset clears it.
 
 ---
 
@@ -254,7 +284,15 @@ Durations are sent in **seconds**; deadlines in ms (server `millis`).
 
 - **Would You Rather** (`t:"wyr"`): `"vote"`/`"reveal"` carry `round`, `rounds`,
   `a`, `b` (the two options), `myvote` (0/1/-1), `counts` ([a,b]). Vote with the
-  existing `answer{c:0|1}` intent. No scoring — it's a poll.
+  existing `answer{c:0|1}` intent. No scoring — it's a poll. Its `"final"` adds
+  `voters` (players connected now) and `rounds` — here an **array** of the whole
+  game's splits, `[{a,b}, …]`, one entry per round played, latched by the ESP at
+  each reveal. (`rounds` is a count in the play phases and this array in `"final"`.)
+  A round nobody voted in is sent as `{"a":0,"b":0}`. The client draws the
+  agreement chart from it: per-round agreement is the majority share
+  `max(a,b)/(a+b)`, bucketed onto the percentages reachable with `voters` players
+  (`ceil(n/2)/n … n/n`), plus the mean. The history has to come from the ESP —
+  a phone that joined late never received the earlier rounds. Firmware **v18**.
 - **Word Scramble** (`t:"scramble"`): `"play"` carries `round`, `rounds`, `scram`
   (shuffled letters), `len`, `solved` (bool, you), `deadline`, `dur`, `scores`.
   Guess with the existing `guess{text}` intent; first correct scores most
@@ -417,3 +455,502 @@ moment either side plays a move.
 State is pushed only on events — a move, resign, draw, claim, or a flag fall the ESP
 notices on its own clock tick — never on a periodic heartbeat; clients animate the
 countdown locally between pushes from `deadline`.
+
+## 10. Secrets (`secrets`) — game id `16`
+
+A whole-group party game on the shared party skeleton (lobby with a ready-up + pack vote,
+countdown, reveal). Content reuses the pack pipeline: each item is a `Q` (one yes/no
+question). Select with UART `SELECT_GAME` id `16`; lobby `game` string `"secrets"`.
+Firmware **v18**.
+
+Each round shows one question and runs **answer → predict → reveal**. First everyone
+secretly **answers** yes/no; then everyone secretly **predicts** how many of the `N` joined
+players said yes (an integer `0..N`); then reveal. Only the group's total yes-count is ever
+revealed — the individual yes/no answers are never serialized to anyone. An exact
+prediction scores 1, otherwise 0. Six rounds.
+
+Client intents: `ready`, `vote{pack}`, `reply{v}` (`1` = yes, `0` = no; answer stage),
+`predict{n}` (your yes-count guess, clamped `0..N`; predict stage), `again`. The distinct
+`reply`/`predict` verbs avoid colliding with Would You Rather's `answer`/`vote`.
+
+Server `{t:"secrets",phase,...}`:
+- `"lobby"`: `you`, `players`, `packs` (name/votes), `myvote`.
+- `"countdown"`: `sec`.
+- `"answer"` / `"predict"`: `round`, `rounds`, `n` (player count / predict upper bound),
+  `q` (the question), `locked`/`total` (aggregate progress in the current step),
+  `myprediction` and `myanswer` (**your own only**, `-1` if unset), `deadline`/`dur` for
+  the timer bar, and `scores` (the shared leaderboard).
+- `"reveal"`: adds `yes` (the group total, the **only** answer information ever sent),
+  `guesses` (`[{nick, n, pts}]` — every player's prediction and points; predictions are
+  guesses about the group, not personal, so they're public here), and `mygain` (your
+  points). No individual yes/no **answer** is ever serialized, in any phase — anonymity is
+  enforced in `secretsJson(pid)`.
+- `"final"`: `board` (the shared leaderboard).
+---
+
+## 11. Player identity — one phone = one player
+
+Firmware **v18**. A player is bound to the **device**, not to the WebSocket. The ESP
+resolves each connection to the station's **MAC address** and keys the player on that; the
+WebSocket layer only knows a peer IP, and that IP is something the ESP's own DHCP server
+made up, so it is a derived value, not an identity.
+
+Why it is needed: a phone could show up as two or three players at once.
+
+- iOS (and Android) open a **captive mini-browser** for the portal. It is a separate
+  browser context from Safari/Chrome with its own `localStorage`, so the saved-identity
+  auto-rejoin the client does cannot help — play in the captive window *and* open
+  `192.168.4.1` in Safari and the ESP used to see two joins. A second tab, or a second
+  browser, is the same story.
+- A phone that drops (screen lock, WiFi off) closes nothing; the ESP only learns about it
+  when TCP times out, which can take minutes. If the phone comes back first, it used to
+  become a new player while the old one lingered as a ghost on the leaderboard.
+
+How the MAC is obtained (all firmware-side, the wire protocol is unchanged): the AP's DHCP
+server reports the assigned address *and* the client MAC together
+(`ip_event_ap_staipassigned_t`), so the firmware keeps a small IP → MAC table from that
+event. A station whose lease predates the handler is looked up in lwIP's ARP cache
+instead, and if the MAC still cannot be resolved the IP itself is used as the key. The
+engine never sees any of this — it stores an opaque 64-bit device key, `0` = unknown.
+
+Modern phones present a randomized "private" MAC, but it is **stable per SSID**: it
+survives reconnects and only changes if the AP is renamed, which is exactly the lifetime a
+session needs.
+
+Rules the ESP applies to `hello`:
+
+1. **Known socket** → the existing player; `nick`/`avatar` in the message are an edit from
+   the header identity editor and are applied (unchanged behaviour).
+2. **New socket, device already playing** → *rebind*: the existing player is re-pointed at
+   the new socket, keeping their `pid`, `nick`, `avatar` and `score`. Never a second
+   player. The `hello`'s own `nick`/`avatar` are ignored (a fresh context sends a name of
+   its own, and letting that rename a player mid-session is the bug, not the fix). No UART
+   `JOIN` is emitted — nobody joined. The `welcome` reply carries the *existing* identity,
+   and the client adopts it, so the second context immediately shows the same name and
+   avatar.
+3. **New socket, new or unknown device** → a new player, exactly as before.
+
+A `DISCONNECT` only removes a player if the closing socket is still that player's **current**
+socket. The superseded context's late close — and any message it still sends — is ignored.
+
+Device key `0` means "unknown" (reported for anything that is not a joined station,
+including the AP's own address) and never matches, so those clients fall back to one player
+per connection.
+
+The ESP traces each decision to its serial console:
+`[ha] JOIN pid=2 ip=192.168.4.3 mac=AA:BB:CC:DD:EE:FF nick="..."` and
+`[ha] NEW BROWSER same device ip=192.168.4.2 mac=AA:BB:CC:DD:EE:FF -> pid=1 nick="..." (consolidated)`.
+
+**Trade-off, deliberate:** two people can no longer share one phone as two players — the
+second `hello` from that phone joins the first player instead of creating a second. Playing
+one phone per person is the assumption everywhere else in the UI (the phone is the
+controller), and duplicate players from a single phone were the far more common failure. A
+phone whose MAC changes (the AP was renamed) simply becomes a new player, which is the
+pre-existing behaviour.
+
+---
+
+## 12. Game-change vote (`gamevote`) — cross-cutting, firmware v18
+
+A player can change the active game **from their phone** by majority vote, so the host
+device needs no operation. This is the one sanctioned phone→host action — the engine
+otherwise forbids a phone from selecting a game — and it is gated entirely behind the vote.
+A host-initiated `SELECT_GAME` stays authoritative and immediate (no vote), and cancels any
+pending proposal.
+
+The vote sits **above** the active game (it is not a per-game phase). While a proposal is
+pending the active game is **frozen**: `tick` advances only the vote timeout, `onInput`
+honors only `voteGame` (and `leaveGame`), and `pushAll` sends the `gamevote` overlay to
+every client instead of any game/lobby state. On resolution the previous state resumes
+(reject/timeout) or the new game's lobby appears (approve), both signalled by the next
+normal `lobby` push — the client closes the modal when a `lobby` message arrives.
+
+Client intents:
+- `proposeGame{game}`: `game` is the engine game-name string (e.g. `"wyr"`, `"trivia"`), or
+  `"none"` for "back to the lobby" — leaving the current game is voted on like any other
+  change. Starts a proposal if none is pending and the target is a valid game **other than
+  the active one** (so `"none"` is refused while already in the lobby). The proposer counts
+  as an implicit YES. A second proposal while one is pending is ignored.
+- `voteGame{ok}`: one vote per non-proposer pid (`true` = OK, `false` = No). From the
+  **proposer**, `ok:true` is a no-op (their YES is already implicit) and `ok:false`
+  **withdraws** the proposal — the reject path, resuming the frozen game at once. That is
+  what the Cancel button on the proposer's own overlay sends; no separate intent exists.
+
+Server `{t:"gamevote",...}` (pushed to every client while pending): `proposer` (nick),
+`avatar` (the proposer's emoji, so the voters' line can lead with it), `game` (target name,
+`"none"` for the lobby), `label` (same as `game`; the client maps it to a pretty label),
+`yes` (count **including** the proposer), `no`, `others` (`playerCount - 1`), `need` (YES
+votes needed from the others = `floor(others/2)+1`), `youproposed`, `youvoted`.
+
+Resolution (recomputed on every vote, join/leave, and tick):
+- **Approve** when YES among the other players is a strict majority — `yesOthers*2 >
+  others` — or immediately if the proposer is the only player. → `selectGame(target)`.
+- **Reject** as soon as that majority is impossible — `noOthers*2 >= others` — or on
+  **timeout** (`GAMEVOTE_SECS` = 25s). → clear and resume the frozen game.
+- **Withdrawn** when the proposer sends `voteGame{ok:false}` (their Cancel button). → same
+  as reject: clear and resume.
+- If the **proposer leaves**, the proposal is cancelled (reject). A non-proposer leaving
+  recomputes the tally (fewer `others` can tip it either way).
+
+On approve the ESP also emits a UART `EVENT` `{"gamevote":"approved","game":"<name>","id":<N>}`
+(the `id` added in v19). The Flipper reads `id` — the numeric `HA_GAME_*` — to update its
+displayed active game to match the vote and to avoid reverting it on an ESP reboot; `game`
+is the short name, for logging. (The Flipper has no name→id map, hence the numeric id.)
+On approve the ESP also emits a UART `EVENT` `{"gamevote":"approved","game":"<name>"}` for
+host-side observability.
+
+## 13. Fill the Blank (`fillblank`) — game id `17`
+
+A whole-group party game on the shared party skeleton (ready-up + pack vote lobby,
+countdown, reveal), in the "a judge picks the funniest answer" shape — inspired by Cards
+Against Humanity, with cards written for this project (no affiliation, and none of their
+text). Select with UART `SELECT_GAME` id `17`; lobby `game` string `"fillblank"`. Firmware
+**v19**.
+
+Content reuses the generic pack pipeline, but a pack carries two decks: a block with a
+`P` key is a **prompt card** (it contains the `_____` blank), a block with an `A` key is
+an **answer card**. Caps are this game's own — `FB_MAX_PACKS` 3 packs, `FB_MAX_PROMPTS` 24
+prompts and `FB_MAX_ANSWERS` 56 answers per pack — not the shared `PACK_MAX_ITEMS`/
+`TRIVIA_MAX_TOPICS`, because an answer deck needs far more than 32 entries and a judging
+game only ever plays one pack per session.
+
+Each round rotates a **Czar** (the `czarSeq mod N`-th connected player, in pid order) and
+shows one prompt. Every other player holds a hand of 6 answer cards and plays exactly one,
+face down; the played card **stays in their hand**, marked as the one they chose while the
+rest grey out, and is discarded and redrawn when the next round deals. When all of them have
+played (or the safety timer expires) the pile is shuffled and shown anonymously.
+
+The pile always carries **one extra answer card drawn at random from the deck itself**,
+judged blind alongside the players'. It is marked internally by the sentinel author pid
+`FB_DECK_PID` (0, never a real pid) and is indistinguishable from a real submission until
+the pick lands.
+
+Only the Czar may pick. Scoring:
+
+| the Czar picks | winning author | Czar |
+| --- | --- | --- |
+| a player's card | +1 | +1 |
+| the deck's card | nobody scores | 0 |
+
+Giving the Czar a point for landing on a real card is what makes judging well worth
+something; picking the deck's card means the deck beat the room and nobody scores at all.
+Hands refill from a draw pile that reshuffles used cards back in, so the deck never dead-
+ends. Six rounds, then the podium.
+
+The game needs a quorum of 3 (a Czar plus two answers to choose between): below that the
+lobby keeps waiting rather than starting a round. A player who joins mid-round is dealt a
+hand immediately but sits that round out (`waiting`); a player who leaves stops being
+waited on, and if the **Czar** leaves the round ends with no winner and the rotation
+carries on.
+
+Client intents: `ready`, `vote{pack}`, `play{card}` (the index of a slot in your own hand),
+`pick{i}` (the Czar's index into the shuffled submissions), `again`.
+
+Server `{t:"fillblank",phase,...}`:
+- `"lobby"`: `you`, `players`, `packs` (name/votes), `myvote`, `min` (the quorum).
+- `"countdown"`: `sec`.
+- `"play"` with `stage` `"play"` | `"judge"` | `"reveal"`: `round`, `rounds`, `czar` (nick),
+  `iam` (am I the Czar), `prompt`, `played`/`total` (submissions in / expected),
+  `deadline`/`dur` for the timer, `scores`.
+  - `hand` is sent **only to its owner** and only when they are not the Czar. It is
+    slot-indexed and an empty slot arrives as `""`, so the index a client sends back in
+    `play{card}` is the slot the engine dealt. `mine` is the slot they played (-1 = none)
+    and `waiting` is true for a player who joined after this round was dealt.
+  - `subs` appears from the judge stage on: an array of **bare card text**, shuffled. It
+    carries no pid, no nick, and no hint of which entry is the deck's own card, so nothing
+    in it maps a card to its author — that is the hidden-information rule this game
+    enforces, and it holds for the Czar's copy too. `played`/`total` count **players**, so
+    the deck's card is never included in the tally.
+  - reveal releases all the authorship at once: `authors` runs parallel to `subs` and names
+    the player who played each card, and `deckcard` is the index in `subs` of the deck's own
+    card (`-1` when there is none). A card whose author has since left serializes as an
+    empty nick, which is why the deck's card is identified by index rather than by an empty
+    author — the two must not be confusable.
+  - reveal also adds `pick` (the winning index in `subs`), `winner` (the author's nick, `""`
+    when the deck won or the round was aborted), `deckwon` (the Czar picked the deck's
+    card), `czarpts` (`1` when the Czar scored), `mywin`, and `mygain` (what *this* player
+    earned this round).
+- `"final"`: `board` (the shared leaderboard).
+
+## 10. Werewolf (`werewolf`) — game id `18`
+
+A whole-group party game on the shared party skeleton (ready-up lobby, countdown), but with
+no content packs — the roles are code. Select with UART `SELECT_GAME` id `18`; lobby `game`
+string `"werewolf"`. Firmware **v19**. Needs **5 players** minimum; the countdown does not
+arm below that.
+
+The phones referee, they do not carry the conversation: players argue out loud in the room
+and only the secret actions and the vote go through the phone. That also makes the phone the
+werewolves' *only* coordination channel — they are sitting in the same room and cannot
+whisper — which is why their tally is pushed live (see `packvotes` below).
+
+**Roles** are dealt over a shuffled roster when the countdown ends: `2` = werewolf, `3` =
+seer, `4` = doctor, `1` = villager. `0` means "not in this game" — a spectator, i.e. someone
+who joined mid-game or whose pid was vacated by a leaver.
+
+| players | werewolves | seer | doctor | villagers |
+| --- | --- | --- | --- | --- |
+| 5 | 1 | 1 | — | 3 |
+| 6 | 1 | 1 | 1 | 3 |
+| 7 | 1 | 1 | 1 | 4 |
+| 8 | 2 | 1 | 1 | 4 |
+| 9–11 | 2 | 1 | 1 | 5–7 |
+| 12 | 3 | 1 | 1 | 7 |
+
+Werewolves are `n / 4` (at least one), capped so the village always starts ahead **and**
+always keeps a plain villager beside its specials. The doctor is dealt from **6 players up**;
+at five the table is small enough already.
+
+**Phases.** `phase` is `"lobby"` / `"countdown"` / `"play"` / `"final"`; play is subdivided
+by `stage`, which cycles:
+
+| stage | window | what happens |
+| --- | --- | --- |
+| `roles` | 12 s | each phone privately shows its own role; werewolves also see the pack |
+| `night` | 60 s, **fixed** | wolves each tap a victim, the seer checks one player, the doctor shields one |
+| `dawn` | 8 s | the night's outcome is announced; a body's role is revealed |
+| `day` | `60 + 20 x living`, clamped to 90–240 s | every living player accuses someone; the tally is public |
+| `dusk` | 8 s | the player voted out (if any) is announced, role revealed |
+
+The **night never ends early**, even when every special role has acted: a short night would
+tell the room how many specials are still alive. The **day** may end early, but only on a
+**hammer** — the moment anyone reaches a strict majority of the living (`living / 2 + 1`),
+which is public information because the day tally is public. Otherwise the window expires and
+whoever did not act is simply skipped; nothing is ever announced about a player failing to
+act, so an idle seer just gets no vision.
+
+**Night resolution.** The wolves' ballot takes the most-picked target, ties broken uniformly
+at random. If no wolf picked at all, **nobody dies** — the engine never invents a kill. If
+the doctor was shielding the chosen target, the attack is **blocked** and nobody dies. A wolf
+may only target a living non-wolf. The doctor may shield **anyone living including
+themselves**, but **not the same player two nights running**. At **6 players or fewer the
+first night takes nobody at all** (`nokill`) — a night-one kill at that size drops the game
+to four with no information; the seer and doctor still act. `dawnkind` distinguishes all four
+outcomes: `killed`, `saved`, `quiet` (no wolf hunted), `nokill`.
+
+**Day resolution.** Plurality, but a **tie hangs nobody** — a village that could not agree
+is a village that does not execute, and a coin-flip lynch quietly favours the wolves. An
+empty ballot likewise hangs nobody.
+
+**Winning.** Villagers win when the last werewolf is out; werewolves win as soon as they are
+no longer outnumbered (`wolves >= villagers`). The check also runs on every roster change, so
+the last werewolf disconnecting is a village win. **Each player still alive on the winning
+side scores 1**, reported over UART `SCORE` with reason `werewolf`.
+
+**Secrecy is enforced server-side.** Roles live only on the ESP and leave it through one
+serializer, which asks a single predicate about every player it emits: you always see your
+own role, werewolves see each other, a dead player's role is public, and at the final every
+role opens up. A role a phone is not entitled to is simply absent from the bytes it receives
+— there is nothing for a client to hide. The same gate covers the seer's reading, the
+doctor's shield and the pack's tally.
+
+Client intents: `ready`, `kill{n}` (living werewolves, night stage), `see{n}` (the seer,
+night stage, one reading per night), `guard{n}` (the doctor, night stage, one shield per
+night), `accuse{n}` (living players with a role, day stage), `again`.
+
+Server `{t:"werewolf",phase,...}`:
+- `"lobby"`: `you`, `players` (nick/avatar/ready), `min` (5), `enough`.
+- `"countdown"`: `sec`.
+- `"play"`: `stage`, `you`, `day` (night/day number), `myrole`, `alive`, `wolvesleft`,
+  `villagersleft`, `deadline`/`dur`, and `players` — each entry `pid`, `nick`, `avatar`,
+  `in` (holds a role), `alive`, and **`role` only when this viewer may see it**.
+  - `owe` says whether **this** phone still has an action outstanding. At night the *count*
+    of outstanding actors is deliberately never sent — it is a headcount of the surviving
+    special roles.
+  - `mykill`, `packsize` and `packvotes` (`by`/`pid`) go **only to living werewolves in the
+    night stage**, pushed on every tap so the pack converges without speaking. A villager's
+    payload carries no trace that a night vote is happening.
+  - `myguard` and `lastguard` (the target barred this night) go **only to the doctor**.
+  - `check` (`pid`/`nick`/`wolf`) goes **only to the seer**, from the moment they look until
+    the next night falls.
+  - `nokill` marks the small-table opening night (public: it follows from the player count).
+  - `dawn` adds `victim` (pid, `0` = nobody died) and `dawnkind`; `dusk` adds `lynched`
+    (pid, `0` = nobody); `day` adds the public `myvote`, `votes` (`by`/`pid`), `waiting`,
+    `voters` and `needed` (the hammer threshold).
+- `"final"`: `winner` (`"villagers"` | `"wolves"`), `myrole`, `players` with every role
+  revealed, `log` (per night: `day`, `victim`, `kind`, `lynched`), and `board` (the shared
+  leaderboard).
+
+## 10. Spyfall (`spyfall`) — game id `19`
+
+A whole-group party game on the shared party skeleton (lobby with a ready-up + pack vote,
+countdown, reveal). Content reuses the pack pipeline with a two-key block: a `Loc:` line
+plus one `R:` line per role played there. Select with UART `SELECT_GAME` id `19`; lobby
+`game` string `"spyfall"`. Firmware **v18**. Minimum **3 players** — the lobby holds until
+three are connected, and the `lobby` message carries `need` so the phone can say so.
+
+Everyone is dealt the same location and a role at it, except a rotating **spy** who is told
+neither and instead receives the pack's full list of candidate locations. The round is
+driven by players **pressing things**, not by a clock: the six minutes are the fallback,
+and running them out does not end the round — it starts a nomination the table has to win.
+
+A playing round (`phase:"play"`) walks four stages:
+
+| `stage` | what it is | ends when |
+|---|---|---|
+| `"card"` | your card is on screen; tap OK | everyone has, or `SPYFALL_CARD_SECS` (30 s) |
+| `"talk"` | card hidden, questioning out loud, buttons live | a button lands, or `SPYFALL_TALK_SECS` (360 s) |
+| `"nominate"` | `nomStage` `"hush"` (4 s) → `"pick"` (30 s) → `"poll"` (20 s), round-robin | an accusation stands, or every seat has nominated |
+| `"reveal"` | location, spy, roles, misses | `SPYFALL_REVEAL_MS` (9 s) |
+
+The **six-minute clock only starts when the last phone has acknowledged its card**, not at
+round start — hardware play showed the round felt "far too fast" when it was already
+running while people were still reading.
+
+During `"talk"`:
+- **`solve{loc}`** ("I know the location", spy only, any time): right or wrong it ends the
+  round. `loc` indexes the `locs` list.
+- **`accuse{pid}`** ("I know the spy", **every** player including the spy — deliberately,
+  as cover the spy can use): right ends the round; wrong records a miss, spends that
+  player's single press for the round (`spent`), and play carries straight on. A spent
+  player's further presses are dropped outright, even a correct one.
+
+During `"nominate"`, once the clock has run out and discussion stops:
+- **`nominate{pid}`** — only the current `nominator`, in `nomStage:"pick"`.
+- **`agree{in}`** — everyone in the round, in `nomStage:"poll"`. The nominator counts as in
+  automatically. A nomination **stands** when the yes count reaches `need` (the number of
+  non-spies, i.e. players in the round minus one) and then settles the round either way:
+  the spy nominated → the table scores; an innocent nominated through → the spy scores.
+  Short of `need` the turn passes to the next seat that hasn't nominated. Once **every**
+  seat has nominated in vain, the spy wins outright.
+
+Scoring — every outcome is worth exactly **1 point**, so the shared leaderboard stays flat
+across all of them:
+
+| `outcome` | who scores |
+|---|---|
+| `caught` | the spy was named (by a press or a standing nomination) → every non-spy **+1** |
+| `escaped` | an innocent was nominated through, or nobody pinned the spy → spy **+1** |
+| `solved` | the spy called the location right → spy **+1** |
+| `failed` | the spy called it wrong → every non-spy **+1** |
+| `aborted` | the spy left, or the table fell under three → nobody scores |
+
+Four rounds, then the podium.
+
+Client intents: `ready`, `vote{pack}`, `seen`, `solve{loc}`, `accuse{pid}`,
+`nominate{pid}`, `agree{in}`, `again`. `accuse`/`solve` are distinct intent names rather
+than reusing `vote`/`guess`, which already carry pack votes and text/colour guesses for
+other games.
+
+Server `{t:"spyfall",phase,...}`:
+- `"lobby"`: `you`, `need`, `players`, `packs` (name/votes), `myvote`.
+- `"countdown"`: `sec`.
+- `"play"`, all stages: `stage`, `round`, `rounds`, `me` (was I dealt into this round — a
+  mid-round joiner is not, and waits for the next one), `spy` (am I the spy),
+  `deadline`/`dur`, `scores`.
+  - `loc` is sent to a **non-spy from the start of the round**, and to the **spy only on
+    reveal**. There is no other field carrying it and the location index is never
+    serialized, so nothing derivable leaks either.
+  - `role` is sent **only to the player holding it**. The full `roles` table exists only
+    on reveal.
+  - `locs` (the pack's whole candidate list, in pack order — identical every round, so it
+    carries no information about this round) goes **only to the spy**.
+  - `"card"` adds `seen` / `total` / `myseen`.
+  - `"talk"` adds `cands` (`pid`/`nick`/`avatar` of everyone in the round), `spent` (have I
+    burnt my accusation) and `misses` (`by`/`of`, the failed accusations so far).
+  - `"nominate"` adds `nomStage` (`hush`|`pick`|`poll`), `cands`, `need`, `nominator` +
+    `nominatorNick`, `nomMe` (is it my turn), and in `poll` also `nominee` +
+    `nomineeNick`, `agreed` and `myagree` (`-1` unanswered, `0` no, `1` in).
+  - `"reveal"` adds `outcome`, `spyPid`/`spyNick`, `called` (the location the spy named, if
+    they did), `blamedNick` (who the round ended on, absent when nobody was pinned),
+    `misses`, `roles` (`pid`/`nick`/`role`/`spy`) and `mygain`.
+- `"final"`: `board` (the shared leaderboard).
+
+The card is hidden on the phone by default in `talk`/`nominate` and only shown while the
+player **holds** the "Show my card" button; that is presentation, and the per-player gating
+above is what actually makes it safe.
+
+Timers, so nobody can stall the room: every wait has a deadline — the card
+acknowledgement, the questioning clock, the hush, each nomination turn, and each agreement
+poll. A nomination turn that expires passes on; a poll that expires resolves with whatever
+was cast. If the spy disconnects (or the table falls under three players) the round ends
+immediately as `aborted` with no scoring, and the rotation carries on into the next round.
+
+---
+
+## 13. Draw a Monster (`frankendraw`) — game id `20`
+
+The exquisite-corpse drawing game, on the shared party skeleton (ready-up lobby,
+countdown, final podium) but with its own three-round body. Select with UART
+`SELECT_GAME` id `20`; lobby `game` string `"frankendraw"`. Firmware **v20**. No content
+packs — its UI strings are localized client-side from the message catalog.
+
+Everyone starts a sheet and everyone draws **at the same time**: round 1 the head, round
+2 the torso, round 3 the legs, 75 seconds each (the round ends early once every player
+has tapped Next). Between rounds the sheets **rotate one seat**, so each sheet is drawn
+by three different players. Minimum three players.
+
+**Sheet geometry.** A sheet is a `unit` x `unit` grid (255) split into three equal
+`band`s of 85; panel *p* owns `[p*band, p*band+band]`. Strokes go up as the same
+`{t:"stroke",x0,y0,x1,y1}` Draw & Guess uses — normalised 0..1 over the whole sheet — and
+the server quantises them onto the grid and clamps both endpoints into the sender's own
+band. Ink comes back down in grid units, as flat `[x0,y0,x1,y1, ...]` arrays. The client
+also draws a faint join mark (a dashed line, two ticks and a "neck"/"legs" label) on each
+band edge so a torso starts near the neck it is continuing; that is presentation only —
+the whole band stays drawable.
+
+**Ink budget.** A panel holds `cap` segments (192, see the memory note). `used` is how
+many it currently holds, so the client can render a filling ink bar and stop the pen at
+the cap; the server refuses anything past it. `{t:"undo"}` drops the last segment of your
+own panel and pushes, so `used` follows it back down. There is no "clear".
+
+**What a drawer may see.** During a round the server sends a drawer exactly one thing:
+the bottom `over` units (7, about 8% of a band) of the panel **directly above theirs**,
+on the sheet **currently in their hands**. A segment is only included if *both* its
+endpoints sit at or below that line, so a stroke that merely dips into the sliver cannot
+drag its other end down with it. Nothing else is serialised — not the rest of that panel,
+not the panel below, not any other sheet — and a drawer's own strokes are never echoed
+back to them. Nothing is relayed live between players at all.
+
+**Rotation, joining and leaving.** Seats are frozen when the game starts (everyone
+connected then, in pid order). In round *r*, seat *k* holds sheet `(k + seats - (r-1)) %
+seats`. Joining mid-game gets no seat (`panel:-1`, `wait:true`) and plays from the next
+game. Leaving vacates the seat for the rest of the game: the sheet in that player's hands
+is **not** reassigned — everybody still playing is already holding a sheet, so handing it
+on would mean drawing two panels at once — it simply rotates on to its next scheduled
+holder, leaving that one panel blank. A panel is credited to whoever held it when the
+round started.
+
+**The gallery walk.** Each finished creature is shown to everyone for 5 s with a progress
+bar, a name label on each band, and thumbs-up / thumbs-down buttons. `{t:"thumb",sheet,v}`
+(`v` > 0 up, < 0 down) applies to the creature currently on screen and only during the
+walk; the same thumb again takes it back. Every tap pushes the (small) state message to
+everyone, so the counts move live for the whole room. After the last creature the winner
+is the highest **net** score (ups minus downs) and is **shown again for 8 s** as the
+finale. Ties break on the most thumbs-up, then on the creature shown first (lowest sheet
+index) — deterministic, because a coin flip is impossible to explain to the room.
+
+**Scoring.** Each sheet pays its net score x 100 points to each of its three
+contributors, floored at zero, so a creature the room disliked earns nothing rather than
+costing the people who drew it. With exactly three players every sheet has the same three
+contributors, so the podium is flat by construction and the crowned creature is the
+result.
+
+Client intents: `ready`, `stroke{x0,y0,x1,y1}`, `undo`, `done`, `thumb{sheet,v}`, `again`.
+
+Server `{t:"frankendraw",phase,...}`:
+- `"lobby"`: `you`, `players`, `need` (3).
+- `"countdown"`: `sec`.
+- `"draw"`: `round`, `rounds` (3), `unit`, `band`, `over`, `cap`, `deadline`/`dur`,
+  `scores`, and per player either `panel:-1`/`wait:true` (no seat) or `panel`, `top`,
+  `bot`, `sheet`, `used`, `done`, `waiting` (how many are still drawing) and `ink` (the
+  sliver above).
+- `"show"`: `n`, `total`, `final` (is this the winner's encore), `up`, `down`, `mine`
+  (your thumb, -1/0/1), `deadline`/`dur`, plus `net` on the finale. Deliberately **no
+  ink**: see `fdart` below.
+- `"final"`: `best` (sheet index), `net`, `who`, `board` (the shared leaderboard).
+
+`{t:"fdart"}` carries the picture itself — `n`, `total`, `unit`, `band`, `who` (the three
+drawers, `""` where a panel went undrawn, used for the band labels) and `ink` (an array of
+three flat panel arrays). It is **broadcast once** when the gallery advances, rather than
+pasted into every `"show"` push, because it is two orders of magnitude bigger than that
+message and `"show"` is re-pushed on every thumb tap. A phone that joins or reconnects
+mid-creature gets one unicast copy.
+
+**Memory.** Sheets live in a fixed array sized for the worst case
+(`HA_MAX_PLAYERS` sheets x 3 panels x `FD_PANEL_STROKES` segments x 4 bytes; 28 KB of
+`.bss` at 192) and are never grown — that budget is the `cap` above, sized to stay
+comfortable on the smallest supported board (the ESP32-S2's 320 KB of SRAM, most of it
+WiFi/lwIP and the heap-held web bundle). Saving is streamed through the `ART` report as
+the gallery walks the sheets, a segment at a time, so keeping the pictures costs no
+additional RAM on either side.
