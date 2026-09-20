@@ -578,7 +578,8 @@ String punchPlayJson(uint8_t pid) {
                ",\"rounds\":" + PUNCH_ROUNDS + ",\"you\":" + pid + ",\"stage\":\"" +
                (reveal ? "reveal" : "vote") + "\",\"match\":" + _punch.matchIdx +
                ",\"matches\":" + _punch.pairCount + ",\"iam\":" + (mine ? "true" : "false") +
-               ",\"a\":\"" + ha_json_escape(pr.textA[0] ? pr.textA : "...") + "\",\"b\":\"" +
+               ",\"prompt\":\"" + ha_json_escape(pr.prompt) +
+               "\",\"a\":\"" + ha_json_escape(pr.textA[0] ? pr.textA : "...") + "\",\"b\":\"" +
                ha_json_escape(pr.textB[0] ? pr.textB : "...") + "\"";
     if(!mine && !reveal) s += ",\"mypick\":" + String((int)_punch.pick[pid]);
     if(reveal) {

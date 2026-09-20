@@ -16,7 +16,7 @@
 #define HA_FW_MAGIC_1 0x41
 #define HA_FW_MAGIC_2 0x52
 #define HA_FW_MAGIC_3 0x43
-#define HA_FW_VERSION 19 // v19: RGB status LED (idle/open/protected)
+#define HA_FW_VERSION 20 // v20: captive-probe success handoff (iOS CNA stays connected)
 
 // Flipper -> ESP
 #define HA_MSG_CLEAR_FILES   0x10

@@ -135,11 +135,17 @@
       return;
     }
 
-    $("punch-vote-meta").textContent = "Раунд " + m.round + " из " + m.rounds + " — пара " + (m.match + 1) + "/" + m.matches;
-    $("punch-vote-prompt").textContent = "";
+    var voted = typeof m.mypick === "number" && m.mypick >= 0;
+    var status = reveal ? ""
+      : m.iam ? " — ты автор, голосуют остальные"
+      : voted ? " — голос принят, ждём остальных"
+      : " — выбери, что смешнее";
+    $("punch-vote-meta").textContent = "Раунд " + m.round + " из " + m.rounds + " — пара " + (m.match + 1) + "/" + m.matches + status;
+    $("punch-vote-prompt").textContent = m.prompt;
     ["a", "b"].forEach(function (side, i) {
       var text = side === "a" ? m.a : m.b;
       var mine = m.mypick === i;
+      var canPick = !reveal && !m.iam && !voted;
       var card = document.createElement("div");
       card.className = "punch-card vote-opt" + (mine ? " mine" : "");
       card.setAttribute("role", "button");
@@ -148,8 +154,10 @@
         (reveal
           ? '<span class="punch-votes">' + esc(side === "a" ? m.nickA : m.nickB) + " · " +
             (side === "a" ? m.votesA : m.votesB) + " голосов · +" + (side === "a" ? m.gainA : m.gainB) + "</span>"
+          : mine ? '<span class="punch-tap">✓ твой выбор</span>'
+          : canPick ? '<span class="punch-tap">нажми, чтобы выбрать</span>'
           : "");
-      if (!reveal && !m.iam && typeof m.mypick === "number" && m.mypick < 0) {
+      if (canPick) {
         card.addEventListener("click", function () {
           A.sfx("buzz"); A.vibe(15);
           send({ t: "pick", n: i });

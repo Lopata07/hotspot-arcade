@@ -20,6 +20,7 @@
 
 #define WS_MSG_MAX 512
 #define AP_MAX_CONN 8
+#define CAPTIVE_AUTH_MAX 15 // matches the "max" SET_AP ceiling below
 
 static DNSServer dnsServer;
 static AsyncWebServer server(80);
@@ -32,6 +33,39 @@ static uint8_t apMaxConn = AP_MAX_CONN;
 
 static AssetStore assets;
 static Engine engine;
+
+// ---------------- captive-probe success handoff ----------------
+// iOS opens its captive mini-browser (CNA) and keeps the network flagged "sign-in
+// required" until something answers its background probe with Apple's exact success
+// page; until then, dismissing or backgrounding the CNA window drops the WiFi
+// association outright. We can't say "internet's fine" before the player has actually
+// joined (or the CNA window would never open with the app in the first place), so a
+// client only starts getting the success page once its WebSocket has connected once —
+// from then on iOS sees a normal network and stops tearing down the connection.
+static uint32_t captiveAuthIp[CAPTIVE_AUTH_MAX] = {0};
+
+static void captiveAuthReset() {
+    memset(captiveAuthIp, 0, sizeof(captiveAuthIp));
+}
+static void captiveAuthMark(IPAddress ip) {
+    uint32_t raw = (uint32_t)ip;
+    for(uint8_t i = 0; i < CAPTIVE_AUTH_MAX; i++) {
+        if(captiveAuthIp[i] == raw) return; // already marked
+    }
+    for(uint8_t i = 0; i < CAPTIVE_AUTH_MAX; i++) {
+        if(captiveAuthIp[i] == 0) {
+            captiveAuthIp[i] = raw;
+            return;
+        }
+    }
+}
+static bool captiveAuthed(IPAddress ip) {
+    uint32_t raw = (uint32_t)ip;
+    for(uint8_t i = 0; i < CAPTIVE_AUTH_MAX; i++) {
+        if(captiveAuthIp[i] == raw) return true;
+    }
+    return false;
+}
 
 // ---------------- status LED ----------------
 // The official devboard carries an RGB LED wired to these three pins. They are not
@@ -136,9 +170,19 @@ void haUartRoundResult(const String& json) {
 
 // ---------------- HTTP (captive) ----------------
 
+// Apple's captive-portal probe checks this exact page verbatim; returning it tells
+// iOS the network has real internet, which closes the CNA window on its own and
+// stops it from tearing down the WiFi association on background/dismiss. Byte-exact,
+// no extra whitespace -- iOS matches the body literally.
+static const char CAPTIVE_SUCCESS_HTML[] =
+    "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
+
 // Serve the streamed web bundle for every host/path so the captive portal always
 // resolves. GET "/" (and every OS captive-probe URL) gets the app; other stored
-// asset paths are served by exact match.
+// asset paths are served by exact match. Exception: once a client's WebSocket has
+// connected at least once, its *next* hit on Apple's probe path gets the success page
+// instead of the app, so the CNA window stops holding the WiFi hostage after they've
+// actually joined.
 class ArcadeHandler : public AsyncWebHandler {
 public:
     bool canHandle(AsyncWebServerRequest* request) const override {
@@ -147,6 +191,11 @@ public:
     }
     void handleRequest(AsyncWebServerRequest* request) override {
         String url = request->url();
+        if(url == "/hotspot-detect.html" && request->host() == "captive.apple.com" &&
+           captiveAuthed(request->client()->remoteIP())) {
+            request->send(200, "text/html", CAPTIVE_SUCCESS_HTML);
+            return;
+        }
         const Asset* a = assets.find(url.c_str());
         if(!a) a = assets.root(); // captive-detection URLs -> the app
         if(!a || !a->buf || a->len == 0) {
@@ -171,7 +220,9 @@ static void onWsEvent(
     uint8_t* data,
     size_t len) {
     (void)srv;
-    if(type == WS_EVT_DISCONNECT) {
+    if(type == WS_EVT_CONNECT) {
+        captiveAuthMark(client->remoteIP());
+    } else if(type == WS_EVT_DISCONNECT) {
         ENGINE_LOCK();
         engine.onWsDisconnect(client->id());
         ENGINE_UNLOCK();
@@ -192,6 +243,7 @@ static void onWsEvent(
 // ---------------- AP lifecycle ----------------
 
 static void startPortal() {
+    captiveAuthReset(); // DHCP reassigns the same IPs to different phones each session
     WiFi.mode(WIFI_AP);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
     // A non-empty password switches the driver to WPA2-PSK; empty keeps the
