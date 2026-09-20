@@ -16,7 +16,7 @@
 #define HA_FW_MAGIC_1 0x41
 #define HA_FW_MAGIC_2 0x52
 #define HA_FW_MAGIC_3 0x43
-#define HA_FW_VERSION 23 // v23: upstream v22 + Punchline, AP password, status LED
+#define HA_FW_VERSION 24 // v24: Punchline -- anonymous Last Lash slots, scaled vote budget
 
 // Flipper -> ESP
 #define HA_MSG_CLEAR_FILES   0x10

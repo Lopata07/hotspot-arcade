@@ -1,14 +1,38 @@
 /* Punchline -- Quiplash-style write-then-vote. The ESP pairs every connected
    player into a ring (you write into your own pair as author A, and into the
    previous pair as author B), so two rounds of paired voting are followed by a
-   "Last Lash" round where everyone answers one prompt and spreads 3 votes across
-   the field. We send ready/vote(pack)/quip(n,text)/pick(n)/lashvote(target,on)/again. */
+   "Last Lash" round where everyone answers one prompt and spreads its vote budget
+   across the field. We send ready/vote(pack)/quip(n,text)/pick(n)/lashvote(slot,on)/again. */
 (function () {
   var myready = false;
   var writtenSlots = {}; // n -> true, so a submitted textarea doesn't resubmit
   var lastWriteRound = -1; // reset writtenSlots whenever a new round's write stage begins
   var writeCards = {}; // n -> card element, so an in-progress textarea from ANOTHER
   // player's broadcast isn't wiped out mid-round (see renderWrite)
+  var secTimer = null;
+
+  // Seconds left, in figures, next to the bar. The bar alone shows a proportion, and a
+  // proportion of an unknown total tells you nothing about whether there is time to
+  // rewrite an answer. A.offset is the clock the shared chrome aligns to the board, so
+  // this counts down against the board's deadline, not the phone's own clock.
+  function secStart(id, deadline) {
+    secStop();
+    var el = $(id);
+    if (!el || !deadline) return;
+    var upd = function () {
+      var left = Math.max(0, Math.ceil((deadline - (Date.now() + A.offset)) / 1000));
+      el.textContent = left + " с";
+      el.classList.toggle("hot", left <= 5);
+      if (left <= 0) secStop();
+    };
+    upd();
+    secTimer = setInterval(upd, 250);
+  }
+
+  function secStop(clearIds) {
+    if (secTimer) { clearInterval(secTimer); secTimer = null; }
+    (clearIds || []).forEach(function (id) { var el = $(id); if (el) el.textContent = ""; });
+  }
 
   function sub(name) {
     ["lobby", "count", "write", "vote", "final"].forEach(function (id) {
@@ -19,6 +43,7 @@
   function renderLobby(m) {
     sub("lobby");
     A.timebarStop("punch-bar"); hide("punch-bar");
+    secStop(["punch-sec", "punch-vote-sec"]);
     myready = A.readyLobby({ players: m.players, listId: "punch-players", readyId: "punch-ready", meId: "punch-me" });
     // A.readyLobby always overwrites the button's textContent with the current UI
     // language's core/i18n.js "common.ready"/"common.ready_cancel" string (there's no
@@ -36,6 +61,7 @@
   function renderCount(m) {
     sub("count");
     A.timebarStop("punch-bar"); hide("punch-bar");
+    secStop(["punch-sec", "punch-vote-sec"]);
     A.countdown("punch-count-num", m.sec);
   }
 
@@ -51,6 +77,7 @@
     // touched again to swap it to the "sent" view once, the moment it becomes done.
     if (m.round !== lastWriteRound) { writtenSlots = {}; lastWriteRound = m.round; writeCards = {}; box.innerHTML = ""; }
     A.timebar("punch-bar", m.deadline, m.dur, true);
+    secStart("punch-sec", m.deadline);
     $("punch-write-meta").textContent = "Раунд " + m.round + " из " + m.rounds;
     var sentHtml = function (p) {
       return '<p class="punch-prompt">' + esc(p.text) + '</p><p class="punch-sent">Отправлено &#10003;</p>';
@@ -105,29 +132,34 @@
   function renderVote(m) {
     sub("vote");
     A.timebar("punch-vote-bar", m.deadline, m.dur, true);
+    secStart("punch-vote-sec", m.deadline);
     var reveal = m.stage === "reveal";
     var box = $("punch-cards");
     box.innerHTML = "";
 
     if (m.lash) {
-      $("punch-vote-meta").textContent = "Последний Смехлыст" + (reveal ? " — Итоги" : " — осталось голосов: " + m.votesLeft);
+      $("punch-vote-meta").textContent = "Последний Смехлыст" +
+        (reveal ? " — Итоги" : " — голосов осталось: " + m.votesLeft + " из " + m.budget);
       $("punch-vote-prompt").textContent = m.prompt;
+      // Authors are anonymous until the reveal -- the board withholds the nick, and the
+      // cards are addressed by shuffled slot, so there is no pid here to match against
+      // the scoreboard either. Your own answer is flagged by the board, not deduced.
       (m.answers || []).forEach(function (a) {
-        var self = a.pid === A.pid;
         var card = document.createElement("div");
-        card.className = "punch-card lash" + (a.mine ? " mine" : "") + (self ? " self" : "");
+        card.className = "punch-card lash" + (a.mine ? " mine" : "") + (a.self ? " self" : "");
         card.innerHTML =
-          '<span class="punch-nick">' + esc(a.nick) + "</span>" +
+          (reveal ? '<span class="punch-nick">' + esc(a.nick) + "</span>"
+                  : a.self ? '<span class="punch-nick">твой ответ</span>' : "") +
           '<p class="punch-ans">' + esc(a.text) + "</p>" +
           (reveal
             ? '<span class="punch-votes">' + a.votes + " голосов · +" + a.gain + "</span>"
-            : self ? "" : '<span class="punch-tap">' + (a.mine ? "✓ отдан голос" : "нажми, чтобы проголосовать") + "</span>");
-        if (!reveal && !self) {
+            : a.self ? "" : '<span class="punch-tap">' + (a.mine ? "✓ отдан голос" : "нажми, чтобы проголосовать") + "</span>");
+        if (!reveal && !a.self) {
           card.addEventListener("click", function () {
             var on = !a.mine;
             if (on && m.votesLeft <= 0) return;
             A.sfx("buzz"); A.vibe(12);
-            send({ t: "lashvote", target: a.pid, on: on });
+            send({ t: "lashvote", slot: a.s, on: on });
           });
         }
         box.appendChild(card);
@@ -173,6 +205,7 @@
     sub("final");
     A.timebarStop("punch-bar"); hide("punch-bar");
     A.timebarStop("punch-vote-bar"); hide("punch-vote-bar");
+    secStop(["punch-sec", "punch-vote-sec"]);
     A.podium("punch-podium", m.scores);
     A.sfx("win"); A.vibe([20, 40, 20]);
   }

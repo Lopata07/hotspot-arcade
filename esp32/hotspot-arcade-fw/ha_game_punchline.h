@@ -51,7 +51,6 @@ struct PunchState {
     // game-state union: WordPack holds Strings, and the union is POD-only.
     int8_t vote[HA_MAX_PLAYERS + 1]; // pack index, -1 = not voted
     uint8_t pack; // chosen pack (locked when the game starts)
-    uint16_t promptSeq; // advances the prompts drawn across rounds
 
     uint8_t stage; // 0 write, 1 vote (both rounds 1-2 and the Last Lash)
 
@@ -67,6 +66,13 @@ struct PunchState {
     char lashText[HA_MAX_PLAYERS + 1][PUNCH_ANSWER_BYTES];
     bool lashIn[HA_MAX_PLAYERS + 1];
     uint8_t lashVotesUsed[HA_MAX_PLAYERS + 1];
+    // Vote cards are addressed by SLOT, not by pid. The whole point of the round is
+    // judging the joke, and the same message carries the scoreboard, so shipping the
+    // author's pid alongside their answer would hand any client the mapping even with
+    // the nick withheld. Slots are a fresh shuffle each round, and the pid never
+    // leaves the board until the reveal.
+    uint8_t lashSlotPid[HA_MAX_PLAYERS]; // slot -> pid
+    uint8_t lashSlotCount;
     bool lashVotedFor[HA_MAX_PLAYERS + 1][HA_MAX_PLAYERS + 1]; // [voter][target]
     uint16_t lashTally[HA_MAX_PLAYERS + 1]; // votes received, by target pid
 
@@ -75,10 +81,40 @@ struct PunchState {
 
 // ---------- punchline (write-then-vote) ----------
 
+// Prompt draw order. The pack is walked through a shuffled permutation instead of
+// straight through words[], and the cursor into it lives in Engine (_punchSeq,
+// outside the game-state union) so punchClear() -- which is what "Play again" runs --
+// cannot reset it. Both matter for the same complaint: a second game on the same pack
+// used to replay the first game's prompts from the top, in the same order.
+//
+// The permutation is rebuilt when the pack changes and when it runs out, so a pack is
+// fully exhausted before any prompt can come round again.
+void punchOrderShuffle(uint8_t packIdx) {
+    WordPack& pk = _punchPacks[packIdx];
+    _punchOrderCount = pk.count;
+    for(uint8_t i = 0; i < _punchOrderCount; i++) _punchOrder[i] = i;
+    for(int i = (int)_punchOrderCount - 1; i > 0; i--) {
+        int j = (int)(esp_random() % (uint32_t)(i + 1));
+        uint8_t t = _punchOrder[i];
+        _punchOrder[i] = _punchOrder[j];
+        _punchOrder[j] = t;
+    }
+    _punchSeq = 0;
+    _punchOrderPack = (int8_t)packIdx;
+}
+
+// Next prompt from the chosen pack, never repeating until the pack is used up.
+const String& punchNextPrompt() {
+    WordPack& pk = _punchPacks[_punch.pack];
+    if(_punchOrderPack != (int8_t)_punch.pack || _punchOrderCount != pk.count)
+        punchOrderShuffle(_punch.pack);
+    if(_punchSeq >= _punchOrderCount) punchOrderShuffle(_punch.pack); // pack exhausted
+    return pk.words[_punchOrder[_punchSeq++]];
+}
+
 void punchClear() {
     partyClear(_punch.pt);
     _punch.pack = 0;
-    _punch.promptSeq = 0;
     _punch.stage = 0;
     _punch.pairCount = 0;
     _punch.matchIdx = 0;
@@ -190,10 +226,9 @@ void punchBuildPairs(uint32_t now) {
         pr = PunchPair{};
         pr.a = order[i];
         pr.b = order[(i + 1) % n];
-        const String& p = pk.words[(_punch.promptSeq + i) % pk.count];
+        const String& p = punchNextPrompt();
         strlcpy(pr.prompt, p.c_str(), sizeof(pr.prompt));
     }
-    _punch.promptSeq += n;
 
     for(int i = 0; i <= HA_MAX_PLAYERS; i++) {
         _punch.pick[i] = -1;
@@ -349,9 +384,8 @@ void punchBuildLash(uint32_t now) {
         pushAll();
         return;
     }
-    const String& p = pk.words[_punch.promptSeq % pk.count];
+    const String& p = punchNextPrompt();
     strlcpy(_punch.lashPrompt, p.c_str(), sizeof(_punch.lashPrompt));
-    _punch.promptSeq++;
 
     for(int i = 0; i <= HA_MAX_PLAYERS; i++) {
         _punch.lashIn[i] = false;
@@ -393,24 +427,50 @@ bool punchLashAllWritten() {
 }
 
 void punchStartLashVoting(uint32_t now) {
+    // Build and shuffle the slot table over everyone who actually submitted.
+    _punch.lashSlotCount = 0;
+    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
+        if(_p[i].used && _punch.lashIn[i]) _punch.lashSlotPid[_punch.lashSlotCount++] = i;
+    for(int i = (int)_punch.lashSlotCount - 1; i > 0; i--) {
+        int j = (int)(esp_random() % (uint32_t)(i + 1));
+        uint8_t t = _punch.lashSlotPid[i];
+        _punch.lashSlotPid[i] = _punch.lashSlotPid[j];
+        _punch.lashSlotPid[j] = t;
+    }
     _punch.stage = 1;
     _punch.pt.deadline = now + (uint32_t)PUNCH_LASH_VOTE_SECS * 1000;
     pushAll();
 }
 
-// Toggle one of a player's 3 votes onto/off a target. Self-votes and over-budget
+// How many votes this player gets in the Last Lash. Fixed at 3, a small table has
+// nothing to decide: at four players you can see three other answers and hold three
+// votes, so you vote for everyone and the round is a formality. The budget is one
+// short of what would cover the whole field, which forces a choice at every size,
+// and never drops below 1 or above PUNCH_LASH_VOTES.
+uint8_t punchLashBudget(uint8_t pid) {
+    uint8_t cand = 0;
+    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
+        if(_p[i].used && _punch.lashIn[i] && i != pid) cand++;
+    if(cand <= 2) return 1;
+    uint8_t b = (uint8_t)(cand - 1);
+    return b > PUNCH_LASH_VOTES ? (uint8_t)PUNCH_LASH_VOTES : b;
+}
+
+// Toggle one of a player's votes onto/off a target. Self-votes and over-budget
 // votes are silently ignored (not an error -- the client already prevents both,
 // this is the judge's own backstop against a hand-crafted WS frame).
-void punchLashVote(uint8_t pid, uint8_t target, bool on) {
+void punchLashVote(uint8_t pid, uint8_t slot, bool on) {
     if(_active != HA_GAME_PUNCHLINE || _punch.pt.phase != 2 || _punch.stage != 1) return;
     if(_punch.pt.round < PUNCH_ROUNDS) return;
     if(_punch.pairRevealing) return; // reveal already fired -- a late/replayed vote must not
                                       // be able to reopen scoring and pay the pool out again
+    if(slot >= _punch.lashSlotCount) return;
+    uint8_t target = _punch.lashSlotPid[slot];
     if(target < 1 || target > HA_MAX_PLAYERS || !_p[target].used || !_punch.lashIn[target] || target == pid) return;
     bool have = _punch.lashVotedFor[pid][target];
     if(on == have) return;
     if(on) {
-        if(_punch.lashVotesUsed[pid] >= PUNCH_LASH_VOTES) return;
+        if(_punch.lashVotesUsed[pid] >= punchLashBudget(pid)) return;
         _punch.lashVotedFor[pid][target] = true;
         _punch.lashVotesUsed[pid]++;
         _punch.lashTally[target]++;
@@ -425,7 +485,7 @@ void punchLashVote(uint8_t pid, uint8_t target, bool on) {
 
 bool punchLashAllVoted() {
     for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++)
-        if(_p[i].used && _punch.lashVotesUsed[i] < PUNCH_LASH_VOTES) return false;
+        if(_p[i].used && _punch.lashVotesUsed[i] < punchLashBudget(i)) return false;
     return true;
 }
 
@@ -476,7 +536,6 @@ void punchTick(uint32_t now) {
         if(partyCountdownDone(pt, now)) {
             pt.round = 0;
             _punch.pack = (uint8_t)punchWinningPack();
-            _punch.promptSeq = 0;
             punchNextRound(now);
         }
         return;
@@ -614,16 +673,18 @@ String punchLashJson(uint8_t pid) {
 
     bool reveal = _punch.pairRevealing;
     s += ",\"stage\":\"" + String(reveal ? "reveal" : "vote") + "\",\"votesLeft\":" +
-         String(PUNCH_LASH_VOTES - _punch.lashVotesUsed[pid]) + ",\"answers\":[";
-    bool first = true;
-    for(uint8_t i = 1; i <= HA_MAX_PLAYERS; i++) {
+         String((int)punchLashBudget(pid) - (int)_punch.lashVotesUsed[pid]) + ",\"budget\":" +
+         String((int)punchLashBudget(pid)) + ",\"answers\":[";
+    for(uint8_t slot = 0; slot < _punch.lashSlotCount; slot++) {
+        uint8_t i = _punch.lashSlotPid[slot];
         if(!_p[i].used || !_punch.lashIn[i]) continue;
-        if(!first) s += ",";
-        first = false;
-        s += String("{\"pid\":") + i + ",\"nick\":\"" + ha_json_escape(_p[i].nick) +
-             "\",\"text\":\"" + ha_json_escape(_punch.lashText[i]) + "\",\"mine\":" +
-             (_punch.lashVotedFor[pid][i] ? "true" : "false");
-        if(reveal) s += ",\"votes\":" + String(_punch.lashTally[i]) + ",\"gain\":" + _punch.gained[i];
+        if(slot) s += ",";
+        s += String("{\"s\":") + slot + ",\"text\":\"" + ha_json_escape(_punch.lashText[i]) +
+             "\",\"mine\":" + (_punch.lashVotedFor[pid][i] ? "true" : "false") + ",\"self\":" +
+             (i == pid ? "true" : "false");
+        if(reveal)
+            s += ",\"nick\":\"" + ha_json_escape(_p[i].nick) + "\",\"votes\":" +
+                 String(_punch.lashTally[i]) + ",\"gain\":" + _punch.gained[i];
         s += "}";
     }
     s += "]";

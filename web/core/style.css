@@ -1023,3 +1023,6 @@ h3{margin:0; font-weight:600}
 .punch-nick{display:block; font-weight:700; font-size:13px; color:var(--text-dim);
   text-transform:uppercase; letter-spacing:.04em; margin-bottom:4px}
 .punch-tap{display:block; margin-top:8px; color:var(--text-dim); font-size:13px}
+.punch-sec{margin-left:auto; font-variant-numeric:tabular-nums; font-weight:700;
+  color:var(--text-dim); font-size:15px}
+.punch-sec.hot{color:var(--orange)}

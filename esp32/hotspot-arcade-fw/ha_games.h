@@ -1647,7 +1647,7 @@ public:
             }
         } else if(strcmp(type, "pick") == 0 && ha_json_int(json, "n", &v)) {
             punchPick(pid, v);
-        } else if(strcmp(type, "lashvote") == 0 && ha_json_int(json, "target", &v)) {
+        } else if(strcmp(type, "lashvote") == 0 && ha_json_int(json, "slot", &v)) {
             const char* onp = ha_json_find(json, "on");
             bool on = !onp || strncmp(onp, "true", 4) == 0; // default true: "vote for" is the common case
             punchLashVote(pid, (uint8_t)v, on);
@@ -1756,6 +1756,13 @@ private:
     WyrPack  _specPacks[TRIVIA_MAX_TOPICS] = {};    uint8_t _specPackCount = 0;    // Spectrum
     WordPack _kmkPacks[TRIVIA_MAX_TOPICS] = {};     uint8_t _kmkPackCount = 0;     // Kiss Marry Kill
     WordPack _punchPacks[TRIVIA_MAX_TOPICS] = {};   uint8_t _punchPackCount = 0;   // Punchline
+    // Punchline's prompt draw order and the cursor into it. Outside the game-state
+    // union on purpose: "Play again" clears the game state, and these must survive it
+    // or the next game replays the same prompts (see punchNextPrompt).
+    uint8_t _punchOrder[PACK_MAX_ITEMS] = {};
+    uint8_t _punchOrderCount = 0;
+    int8_t _punchOrderPack = -1; // which pack _punchOrder was built for, -1 = none
+    uint16_t _punchSeq = 0;      // how far into _punchOrder we have drawn
     WordPack _secretsPacks[TRIVIA_MAX_TOPICS] = {}; uint8_t _secretsPackCount = 0; // Secrets
     FillBlankPack _fbPacks[FB_MAX_PACKS] = {};      uint8_t _fbPackCount = 0;      // Fill the Blank
     SpyPack  _sfPacks[SPYFALL_MAX_PACKS] = {};      uint8_t _sfPackCount = 0;      // Spyfall

@@ -284,7 +284,9 @@ for (let match = 1; match < 4; match++) {
   for (let ms = 0; ms < 5500; ms += 500) out = out.concat(e.tick(rev.msg.deadline - 5000 + ms));
 }
 
-// Round 3, "Last Lash": one prompt, everyone writes, everyone gets 3 votes.
+// Round 3, "Last Lash": one prompt, everyone writes, everyone gets a vote budget
+// scaled to the table (cand-1, capped at PUNCH_LASH_VOTES) and the cards are
+// anonymous until the reveal.
 let m3 = lastToWs(out, 1, "punch");
 assert.equal(m3.msg.round, 3, "round 3 reached");
 assert.equal(m3.msg.lash, true, "round 3 is flagged as the Last Lash");
@@ -294,40 +296,60 @@ let mv = lastToWs(out, 1, "punch");
 assert.equal(mv.msg.stage, "vote", "Last Lash moves to voting once everyone wrote");
 assert.equal(mv.msg.answers.length, 4, "all 4 answers listed");
 
-// Everyone dumps all 3 votes onto player 1 (self-votes are rejected by the server,
-// so each voter's 3 targets come from the other 3 players -- for 4 players total
-// that's exactly "the other 3", so this also proves the self-vote rejection: a
-// vote for yourself must be silently ignored, not consume a vote slot).
+// Anonymity is the board's job, not the client's: while voting is open, a card must
+// carry neither the author's nick nor their pid. The same message ships the
+// scoreboard, so a pid would be as good as a name.
+for (const a of mv.msg.answers) {
+  assert.equal(a.nick, undefined, "no nick on a card while voting is open");
+  assert.equal(a.pid, undefined, "no pid on a card while voting is open");
+  assert.equal(typeof a.s, "number", "cards are addressed by shuffled slot");
+}
+assert.equal(mv.msg.answers.filter((a) => a.self).length, 1, "exactly one card is flagged as your own");
+
+// Four players: three other answers, so the budget is one short of the field (2).
+// A budget that covers everyone is not a choice, which is what made this round dull.
+assert.equal(mv.msg.budget, 2, "N=4: budget is cand-1 = 2, not the full 3");
+assert.equal(mv.msg.votesLeft, 2, "nothing spent yet");
+
+// Self-vote by slot must be a silent no-op that does not consume budget.
+const mySlot = mv.msg.answers.find((a) => a.self).s;
+const selfVote = e.input(1, { t: "lashvote", slot: mySlot, on: true });
+assert.equal(selfVote.length, 0, "a vote for your own slot is a silent no-op");
+assert.equal(lastToWs(out, 1, "punch").msg.votesLeft, 2, "a rejected self-vote costs no budget");
+
+// Everyone spends their full budget on the first two slots that are not their own.
 for (const voter of [1, 2, 3, 4]) {
-  out = e.input(voter, { t: "lashvote", target: voter, on: true }); // rejected: self-vote
-  const targets = [1, 2, 3, 4].filter((p) => p !== voter);
-  for (const target of targets) out = e.input(voter, { t: "lashvote", target, on: true });
+  const mine = lastToWs(out, voter, "punch");
+  const slots = mine.msg.answers.filter((a) => !a.self).map((a) => a.s).slice(0, mine.msg.budget);
+  for (const slot of slots) out = e.input(voter, { t: "lashvote", slot, on: true });
 }
 const rev3 = lastToWs(out, 1, "punch");
-assert.equal(rev3.msg.stage, "reveal", "Last Lash reveals once everyone used all 3 votes");
-const p1 = rev3.msg.answers.find((a) => a.pid === 1);
-assert.equal(p1.votes, 3, "player 1 got a vote from everyone else (3)");
-// Exact share, not just ">0": with 4 players, totalVotes=12 and every player's tally=3
-// (each of the other 3 casts exactly one vote for them), so the pool math is fully
-// determined: (3000*3 + 12/2) / 12 = 750 for every player, summing to exactly 3000 --
-// a wrong formula, wrong rounding, or a stray bonus couldn't accidentally satisfy this.
-assert.equal(p1.gain, 750, "player 1's exact pool share");
+assert.equal(rev3.msg.stage, "reveal", "Last Lash reveals once everyone spent their budget");
+// 4 voters x 2 votes = 8 votes in the denominator, and the pool is conserved whatever
+// the shuffle handed out.
+const totalVotes = rev3.msg.answers.reduce((sum, a) => sum + a.votes, 0);
+assert.equal(totalVotes, 8, "every player cast exactly their 2 votes");
 const gainSum = rev3.msg.answers.reduce((sum, a) => sum + a.gain, 0);
 assert.equal(gainSum, 3000, "all 4 players' pool shares sum to exactly the 3000-point pool");
+for (const a of rev3.msg.answers) {
+  assert.ok(a.nick, "the reveal names the authors");
+  assert.equal(a.gain, Math.round((3000 * a.votes) / totalVotes), "each share is its exact proportion of the pool");
+}
 
 // Critical-fix regression: a vote message that arrives during the reveal window
 // (pairRevealing already true) must not be able to reopen voting and pay the pool
 // out a second time -- punchLashVote() must guard on _punch.pairRevealing exactly
 // like punchPick() already does for rounds 1-2.
-const replayDrain1 = e.input(1, { t: "lashvote", target: 2, on: false }); // toggle off
-const replayDrain2 = e.input(1, { t: "lashvote", target: 2, on: true }); // toggle back on
+const otherSlot = rev3.msg.answers.find((a) => !a.self).s;
+const replayDrain1 = e.input(1, { t: "lashvote", slot: otherSlot, on: false }); // toggle off
+const replayDrain2 = e.input(1, { t: "lashvote", slot: otherSlot, on: true }); // toggle back on
 assert.equal(replayDrain1.length, 0, "a vote during the reveal window must be a silent no-op");
 assert.equal(replayDrain2.length, 0, "toggling back on during the reveal window must also no-op");
 const rev3b = lastToWs(out, 1, "punch");
 assert.equal(rev3b.msg.stage, "reveal", "still the same reveal -- state must be unaffected by the stray vote");
 assert.equal(rev3b.msg.deadline, rev3.msg.deadline, "reveal window must not be extended by a stray vote");
-const p1b = rev3b.msg.answers.find((a) => a.pid === 1);
-assert.equal(p1b.gain, 750, "pool share must not be paid out a second time");
+const gainSumB = rev3b.msg.answers.reduce((sum, a) => sum + a.gain, 0);
+assert.equal(gainSumB, 3000, "the pool must not be paid out a second time");
 
 for (let ms = 0; ms < 9000; ms += 1000) out = out.concat(e.tick(rev3.msg.deadline - 8000 + ms));
 const fin = lastToWs(out, 1, "punch");
@@ -408,19 +430,15 @@ console.log("punchline: Last Lash, podium, and replay checks passed");
   const mVoteG = lastToWs(outG, 1, "punch");
   assert.equal(mVoteG.msg.stage, "vote", "gap test: write deadline moves on even though player " + silent + " never wrote");
   assert.equal(mVoteG.msg.answers.length, n - 1, "gap test: only the " + (n - 1) + " who wrote have answer cards");
-  assert.ok(
-    !mVoteG.msg.answers.some((a) => a.pid === silent),
-    "gap test: the silent player has no answer card at all",
-  );
 
-  // The crafted frame: some other connected voter tries to vote for the silent
-  // player's pid directly (bypassing the UI, which could never construct this
-  // vote since it only reads targets from m.answers). Their votesLeft must NOT
-  // decrease -- the vote must be rejected outright, not merely uncounted.
+  // The crafted frame: a voter reaches past the slot table for a target the UI could
+  // never offer. Slots only exist for players who actually submitted, so the silent
+  // player has none -- the out-of-range slot is now the only way to aim at them, and
+  // it must be rejected outright, not merely uncounted. votesLeft must not move.
   const attacker = ids.find((p) => p !== silent);
   const attackerBefore = lastToWs(outG, attacker, "punch");
   const beforeVotesLeft = attackerBefore.msg.votesLeft;
-  const afterCraftedVote = eg.input(attacker, { t: "lashvote", target: silent, on: true });
+  const afterCraftedVote = eg.input(attacker, { t: "lashvote", slot: n - 1, on: true });
   // A rejected vote is a silent no-op: no message should even be pushed for it.
   assert.equal(afterCraftedVote.length, 0, "gap test: a vote for a never-submitted target must be a silent no-op");
   const attackerAfter = lastToWs(outG.concat(afterCraftedVote), attacker, "punch");
@@ -447,8 +465,9 @@ console.log("punchline: Last Lash, podium, and replay checks passed");
   const real = ids.filter((p) => p !== silent);
   const mVoteBeforeReal = lastToWs(outG, real[0], "punch");
   for (const voter of real) {
-    const targets = real.filter((p) => p !== voter);
-    for (const target of targets) outG = eg.input(voter, { t: "lashvote", target, on: true });
+    const mine = lastToWs(outG, voter, "punch");
+    const slots = mine.msg.answers.filter((a) => !a.self).map((a) => a.s).slice(0, mine.msg.budget);
+    for (const slot of slots) outG = eg.input(voter, { t: "lashvote", slot, on: true });
   }
   const mStillVoting = lastToWs(outG, real[0], "punch");
   assert.equal(mStillVoting.msg.stage, "vote", "gap test: silent player " + silent + " still owes votes -- all-voted must not fire early");
@@ -460,11 +479,85 @@ console.log("punchline: Last Lash, podium, and replay checks passed");
   assert.equal(revG.msg.stage, "reveal", "gap test: reveal fires once the Last Lash vote deadline passes");
   assert.equal(revG.msg.answers.length, n - 1, "gap test: reveal still only lists the " + (n - 1) + " real answers");
   assert.ok(
-    !revG.msg.answers.some((a) => a.pid === silent),
-    "gap test: silent player still absent from the reveal -- never got a pid-keyed payout slot",
+    !revG.msg.answers.some((a) => a.nick === "G" + silent),
+    "gap test: silent player still absent from the reveal -- never got a payout slot",
   );
   const gainSumG = revG.msg.answers.reduce((sum, a) => sum + a.gain, 0);
   assert.equal(gainSumG, 3000, "gap test: pool still sums to exactly 3000 -- the silent player's pid received no share");
 
   console.log("punchline: Last Lash vote-for-non-submitter rejection (Fix 3) check passed");
+}
+
+// Prompt reuse across games. Reported from a real session: "the prompts came round
+// again on the second game". They did -- punchTick() reset the pack cursor to 0 when a
+// game started, and "Play again" runs punchClear(), so a second game on the same pack
+// dealt the same prompts from the top in the same order. The cursor now lives in the
+// Engine (outside the game-state union) and walks a shuffled permutation, so a pack is
+// exhausted before anything repeats.
+{
+  const n = 4;
+  const ep = await newEngine();
+  ep.reset();
+  for (let pid = 1; pid <= n; pid++) ep.join(pid, "R" + pid);
+  ep.selectGame(PL);
+  ep.contentClear();
+  ep.contentPack(PL, "Test");
+  const POOL = 20; // 4 players => 4+4+1 = 9 prompts a game, so two games fit in the pack
+  for (let i = 0; i < POOL; i++) ep.contentItem(JSON.stringify({ prompt: "Pool prompt " + i }));
+  const ids = Array.from({ length: n }, (_, i) => i + 1);
+
+  let o = [];
+  let now = 0;
+  const tick = (to) => { now = Math.max(now, to); o = o.concat(ep.tick(now)); };
+  const state = (pid) => lastToWs(o, pid, "punch").msg;
+
+  // Play one whole game start to podium, returning every prompt it dealt.
+  const playGame = () => {
+    const seen = [];
+    for (const pid of ids) o = o.concat(ep.input(pid, { t: "ready", ready: true }));
+    for (let i = 0; i < 5; i++) tick(now + 1000);
+    for (let round = 1; round <= 2; round++) {
+      for (const p of state(1).prompts) seen.push(p.text);
+      for (const pid of ids) {
+        for (const p of state(pid).prompts) {
+          o = o.concat(ep.input(pid, { t: "quip", n: p.n, text: "r" + round + " " + pid + "-" + p.n }));
+        }
+      }
+      for (let match = 0; match < n; match++) {
+        const voters = ids.filter((pid) => {
+          const m = state(pid);
+          return m.stage === "vote" && m.match === match && !m.iam;
+        });
+        for (const voter of voters) o = o.concat(ep.input(voter, { t: "pick", n: 0 }));
+        const rev = state(voters[0]);
+        for (let ms = 0; ms <= 5500; ms += 500) tick(rev.deadline - 5000 + ms);
+      }
+    }
+    seen.push(state(1).prompt); // the Last Lash prompt
+    for (const pid of ids) o = o.concat(ep.input(pid, { t: "quip", n: 0, text: "lash " + pid }));
+    for (const voter of ids) {
+      const mine = state(voter);
+      const slots = mine.answers.filter((a) => !a.self).map((a) => a.s).slice(0, mine.budget);
+      for (const slot of slots) o = o.concat(ep.input(voter, { t: "lashvote", slot, on: true }));
+    }
+    const rev = state(1);
+    for (let ms = 0; ms <= 9000; ms += 1000) tick(rev.deadline - 8000 + ms);
+    assert.equal(state(1).phase, "final", "game reached the podium");
+    return seen;
+  };
+
+  const seen1 = playGame();
+  assert.equal(new Set(seen1).size, seen1.length, "game 1 deals no prompt twice");
+
+  o = o.concat(ep.input(1, { t: "again" }));
+  for (const pid of ids) o = o.concat(ep.input(pid, { t: "ready", ready: false }));
+  const seen2 = playGame();
+  assert.equal(new Set(seen2).size, seen2.length, "game 2 deals no prompt twice");
+  const overlap = seen2.filter((p) => seen1.includes(p));
+  assert.equal(
+    overlap.length, 0,
+    "game 2 must not replay game 1's prompts while the pack still has unused ones (overlap: " + overlap.join(", ") + ")",
+  );
+
+  console.log("punchline: prompts never repeat across games until the pack is exhausted");
 }
